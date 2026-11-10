@@ -27,6 +27,13 @@ venv/
 # Chorus / Claude session state
 .chorus/
 .claude/
+
+# WorkBuddy / slidep session state
+.workbuddy/
+.slidep/
+
+# generated deliverables (docx / slides / logs)
+output/
 CLAUDE.md
 minimax_output.wav
 *.wav
