@@ -250,7 +250,9 @@ var serviceBusName = 'sb-voicebot-${environmentName}'
 var keyVaultName = 'kv-voicebot-${environmentName}'
 var acrName = 'acrvinebot${environmentName}'
 var caeName = 'cae-voicebot-${environmentName}'
-var storageAccountName = 'stvoicebot${environmentName}'
+// plan §2 命名偏差（2026-11-11 what-if 实测）：storage 帐户名为全局唯一命名空间，
+// stvoicebot<env> 的 dev/prod 已被第三方占用 → 统一加项目缩写后缀 vap（三环境一致）
+var storageAccountName = 'stvoicebot${environmentName}vap'
 var logAnalyticsName = 'log-voicebot-${environmentName}'
 
 resource rg 'Microsoft.Resources/resourceGroups@2024-03-01' = {
@@ -394,8 +396,11 @@ module containerApps 'modules/containerApps.bicep' = {
     containerAppsEnvName: caeName
     logAnalyticsCustomerId: monitor.outputs.LOG_ANALYTICS_CUSTOMER_ID
     // shared key 是密钥面：main 以确定性 workspace ID 经 listKeys 即取即传（@secure
-    // 参数），不入模块输出（模块输出值非部署起点值，listKeys 不收——BCP181）
-    logAnalyticsSharedKey: listKeys(resourceId(rg.name, 'Microsoft.OperationalInsights/workspaces', logAnalyticsName), '2023-09-01').primarySharedKey
+    // 参数），不入模块输出（模块输出值非部署起点值，listKeys 不收——BCP181）。
+    // 订阅级模板里 resourceId 必须用 4 参形制（订阅+RG+类型+名）；3 参 (rg,type,name)
+    // 形制只在 RG 级模板有效，在订阅级会被解析为 (subscriptionId,...) 并报
+    // "not valid subscription identifier"（what-if 实测，2026-11-11）
+    logAnalyticsSharedKey: listKeys(resourceId(subscription().subscriptionId, rg.name, 'Microsoft.OperationalInsights/workspaces', logAnalyticsName), '2023-09-01').primarySharedKey
     containerImage: containerImage
     runtimeIdentityId: identities.outputs.MI_RUNTIME_ID
     controlIdentityId: identities.outputs.MI_CONTROL_ID

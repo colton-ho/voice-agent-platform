@@ -53,7 +53,7 @@ for entry in "${SECRET_MAP[@]}"; do
   fi
 done
 
-echo "==> 写入 $VAULT（4 个 secret；值不回显）"
+echo "==> 写入 ${VAULT}（4 个 secret；值不回显）"
 for entry in "${SECRET_MAP[@]}"; do
   read -r env_name kv_name <<<"$entry"
   # --query name 只回显 secret 名；值不进输出/日志/磁盘

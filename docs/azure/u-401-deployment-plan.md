@@ -41,11 +41,13 @@ Resource group `rg-voicebot-<env>`，單區域（`AZURE_LOCATION`，cost-analysi
 | Container Apps env | `cae-voicebot-<env>` | 關聯 Log Analytics |
 | 三 app | `ca-voicebot-<env>-control` / `-runtime` / `-worker` | |
 | MI | `mi-voicebot-<env>-runtime` / `-control` / `-worker` | |
-| Blob | `stvoicebot<env>`（去連字符） | 私有容器 `artifacts` |
+| Blob | `stvoicebot<env>vap`（去連字符；命名偏差見下） | 私有容器 `artifacts` |
 | App Insights | `appi-voicebot-<env>` | |
 | Log Analytics | `log-voicebot-<env>` | |
 
 > 注（CR note，契约文本不动）：`SERVICEBUS_NAMESPACE` 工作约定=**短名** `sb-voicebot-<env>`（Bicep 输出 `namespace.name`；`storage/servicebus.py` 拼接 `.servicebus.windows.net` 组成 FQDN）。冻结契约 `_MEANINGS` 文本写 "fully qualified"，实际有效约定=短名——差异在此备案。
+
+> 注（命名偏差 B3，2026-11-11 what-if 实测追认）：storage 帐户名是**全局唯一**命名空间，`stvoicebot<env>` 形制的 dev/prod 已被第三方占用（`az storage account check-name` 返回 AlreadyExists；本订阅并无此二帐户）。改为 `stvoicebot<env>vap`（项目缩写后缀，三环境一致，均实测可用）。ACR/KV 名全局唯一但实测可用，命名不动。
 
 ## 3. 身份與 RBAC（pipeline-infra-spec §5 十行，落 identities.bicep）
 
