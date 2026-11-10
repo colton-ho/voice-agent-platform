@@ -244,6 +244,7 @@ Claude 在 Microsoft Foundry 有原生版本（GA 2026-06-29）。兩種托管�
 | N3 I-4 delivery_count 雙約定註 | postcall worker 失敗腿終態判定（workers/postcall_worker.py） | `delivery_count >= maxDeliveryCount-1` 穩健實現 | 計數 0-based/1-based 雙約定下純 `==5` 會**永卡 pending**、違硬不變式（重試耗盡必落 failed 終態——I-4 裁決 2026-11-09）；V6 leg 2 釘 spec 字面值 maxDeliveryCount=5 | —（行為註記；test_postcall_worker 覆蓋） | 否（實現註） |
 | U-103 修復環 dev 偏差 ①–④ 处置 | tests/test_cascade_engine.py +1 函數 / test_tool_filler:243 構造計數 / u-103-report §三 / F-11 測試腿 | ①+1 函數=F-11 回收測試落點（FakeSTT fixture 唯一家園，等價釘落點，既有測試零動）②「:243/:286 兩處構造」更正=一處（:286=同因失敗面）③§三 計數一致性快照 10→11/4→5 ④F-11 測試釘 stopped==1、可重試腿歸 QA 探針 e24（分工明示，零空斷言） | 四項均裁接受（u-103-review dev 偏差表）；本行為 §6 錨 | —（測試面註記）【u-103-review dev 偏差 ①–④ 錨】 | 否（測試面） |
 | 測試面機會性簡化（未做） | tests/test_engine_languages.py:243–244 monkeypatch.setenv + _isolate_runtime 雙保險 | 既裁 opportunistic 簡化**未做**（錯過 B-3 窗口，避免額外擾動） | 保持原狀（功能等價）；如需簡化=一個 hunk，另批 | —（注記）【verification 偏差 8 錨】 | 否（未做） |
+| U-401 KV 直讀兜底裁撤（`_kv_secret`） | B-5① 條件接受之兜底通道（verification 偏差 4 錨→U-401 掛帳）：`resolve_secret` env 優先、缺則 §3.1 凍結名 MI 直讀（lazy import azure-keyvault-secrets/azure-identity）；「KV 直讀兜底條件注」行裁撤支兌現 | `resolve_secret` 收窄 **env-only**（主通道 §3.2 secretRef env 注入；ACA 平台級 Key Vault 引用全覆蓋）；`_kv_secret` 刪除、不留死代碼 | deviation ④ 裁決落定（u-401-deployment-plan §4/D1）：requirements 未釘 azure-keyvault-secrets（CR-C2 最小依賴面、無運行時消費者）；test_startup_secrets 隨行轉釘「兜底已滅」（6 測數不變，假 KV SDK tripwire 防復活）；反向支（釘版留兜底）留檔備查，回轉=小 revert | 【手動驗證】啟動期 env 注入密鑰解析正常（secretRef 注入下 AUTH_SECRET fail-fast 不觸發、MINIMAX 注入縫取到值） | 否（內部縫，對外面不動） |
 
 ---
 

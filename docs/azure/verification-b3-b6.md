@@ -59,7 +59,7 @@ cosmos.bicep（8 容器+CI-1 复合索引+defaultTtl:-1+Session+backup）/ servi
 1. **红数口径**：续跑令「红数回到恰好 C4×4」→ 实测 **C4×2**。C4×4 账面含 test_history finalize×2，已按「两测转绿」销项；余 2 红签名不变。两要求算术互斥，按显式验收项执行，请裁定 #19 C4 口径。
 2. **HISTORY 默认启用**：discovery:156 旧语义「HISTORY_TABLE 空⇒禁用」→ 实际「默认启用，HISTORY_DISABLED=1 禁用」。理由：B10/BC-c1 表名 env 退役+discovery:256 keep-only-HISTORY_DISABLED。**行为翻转属运维可见面，请复核**（要 opt-in 请出变更）。
 3. `test_history_disabled_when_table_empty` → `test_history_enabled_by_default` 重指（钉新真值；断言意图从"空表禁用"转"默认启用"，随偏差 2）。
-4. B-5① KV 直读=兜底通道（主通道 §3.2 secretRef env 注入）；azure-identity/azure-keyvault-secrets 未装（lazy import 降级 warning）→ U-401 requirements 挂账。
+4. B-5① KV 直读=兜底通道（主通道 §3.2 secretRef env 注入）；azure-identity/azure-keyvault-secrets 未装（lazy import 降级 warning）→ U-401 requirements 挂账。**U-401 裁决落定**：未钉 azure-keyvault-secrets，裁撤兜底（bot.py `resolve_secret` 收窄 env-only、`_kv_secret` 删除），详见 mapping §6 新行 + u-401-deployment-plan §4。
 5. B-5③ 顺行文档面：scripts/migrate_demos_to_ddb.py docstring+help 文案（DEMOS_TABLE 语义指向 §1.1 容器）。
 6. test_config_contract.py:231 `"USERS_TABLE"` 保留=「旧变量不被读取」防朽钉，非消费残留。
 7. 修红读回侧重指（moto→FakeCosmos）为修法①实施细节，断言形状逐字保留。

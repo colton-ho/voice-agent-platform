@@ -155,33 +155,19 @@ ACTIVITY_STORE = ActivityStore()
 COOKIE_NAME = "vb_session"
 
 # --- Startup secret resolution (CR-C1 / B-5①, spec §3.2) -----------------
-def _kv_secret(secret_name: str) -> str:
-    """§3.2 MI 直读兜底通道（Key Vault Secrets User，§5 #3）。只驻内存——不落
-    盘、不进 config。SDK 未装/不可达 → ""（主通道=Container Apps secretRef env 注入）。"""
-    vault_url = (os.environ.get("KEY_VAULT_URL") or "").strip()
-    if not vault_url:
-        return ""
-    try:
-        from azure.identity import DefaultAzureCredential
-        from azure.keyvault.secrets import SecretClient
-
-        client = SecretClient(vault_url=vault_url, credential=DefaultAzureCredential())
-        return (client.get_secret(secret_name).value or "").strip()
-    except Exception as e:
-        logger.warning(f"Key Vault secret {secret_name!r} unresolved: {e}")
-        return ""
-
-
 def resolve_secret(env_name: str, kv_secret_name: str) -> str:
-    """B-5① 启动期取密钥（§3.2「啟動期取密鑰」语义，对应旧 UserData 路径）：
-    env（secretRef 注入/本地测试缝）优先，缺则 §3.1 冻结 secret 名 MI 直读。"""
-    return (os.environ.get(env_name) or "").strip() or _kv_secret(kv_secret_name)
+    """B-5① 启动期取密钥（§3.2「啟動期取密鑰」语义）：env-only（secretRef 注入/
+    本地测试缝），缺值回空串、由调用方 fail-fast。deviation ④/U-401 裁撤 KV 直读兜底
+    （_kv_secret 已删）：ACA 平台级 Key Vault 引用覆盖 §3.2 主通道，requirements 不引
+    azure-keyvault-secrets（CR-C2 最小依赖面）。kv_secret_name=§3.1 冻结名对照，
+    为签名相容保留（:194/:1842 调用点），不再被读取。"""
+    return (os.environ.get(env_name) or "").strip()
 
 
 def resolve_api_keys() -> dict:
     """CR-C1 注入缝取值：build_cascade_engine(speech_api_key=…, llm_api_key=…,
-    minimax_api_key=…) 的启动期解析源。speech/llm 无 §3.1 KV secret 名（名单
-    冻结，补名属 CR 裁定）→ env 直给，缺省空串=MI 模式。"""
+    minimax_api_key=…) 的启动期解析源。全部 env 直给（deviation ④ 裁撤后无 KV
+    直读第二通道），缺省空串=MI 模式。"""
     return {
         "speech_api_key": (os.environ.get("SPEECH_KEY") or "").strip(),
         "llm_api_key": (os.environ.get("LLM_API_KEY") or "").strip(),
