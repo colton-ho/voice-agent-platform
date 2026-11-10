@@ -1,4 +1,4 @@
-"""Unit tests for activity_store.ActivityStore (T3 / Part B) — DDB-backed
+"""Unit tests for activity_store.ActivityStore (T3 / Part B) — Cosmos-backed
 operations audit log + DEFAULT-DENY redaction.
 
 Coverage (AC#1, #2, #5):
@@ -9,13 +9,14 @@ Coverage (AC#1, #2, #5):
     NAME ONLY ("***changed***"), never its value — the allowlist is the
     primary defence, not the substring scrub. Unknown type masks all values.
   - query() filters by actor/type + date range, newest-first, paginates.
-  - Table-missing: log() is a silent no-op AND a simulated underlying op runs
-    unaffected; query() -> empty. No raise.
-  - Lazy table: constructing an ActivityStore against an absent table never
-    raises (the boto3 Table is built on first USE, not in __init__).
+  - Container-missing: log() is a silent no-op AND a simulated underlying op
+    runs unaffected; query() -> empty. No raise.
+  - Lazy container: constructing an ActivityStore against absent storage never
+    raises (containers resolve on first USE, not in __init__).
 
-DynamoDB is mocked with moto (mock_aws). Best-effort/lazy paths run without a
-live table.
+Storage is the in-memory Cosmos fake (tests/fake_cosmos.py) injected through
+the storage.cosmos provider seam. Best-effort/lazy paths run with a provider
+that raises ContainerNotFound (missing-container semantics).
 """
 
 from __future__ import annotations
@@ -24,14 +25,7 @@ import asyncio
 import time
 import uuid
 
-import boto3
 import pytest
-
-try:
-    from moto import mock_aws
-    _HAVE_MOTO = True
-except Exception:  # pragma: no cover
-    _HAVE_MOTO = False
 
 import activity_store
 from activity_store import (
@@ -39,45 +33,28 @@ from activity_store import (
     _sanitize_detail,
     ACTIVITY_DETAIL_VALUE_ALLOWLIST,
 )
+from fake_cosmos import FakeCosmos
+from storage import cosmos
+from storage.cosmos import ContainerNotFound
 
-ACTIVITY_TABLE = "voicebot-test-activity"
 _MASK = "***changed***"
 
 
 @pytest.fixture
-def ddb_env(monkeypatch):
-    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
-    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "testing")
-    monkeypatch.setenv("AWS_DEFAULT_REGION", "us-east-1")
-    monkeypatch.setenv("AWS_REGION", "us-east-1")
-    monkeypatch.setenv("ACTIVITY_TABLE", ACTIVITY_TABLE)
-    yield
+def fake():
+    f = FakeCosmos()
+    cosmos.set_container_provider(f)
+    yield f
+    cosmos.reset_container_provider()
 
 
-def _create_activity_table(region: str = "us-east-1") -> None:
-    ddb = boto3.client("dynamodb", region_name=region)
-    ddb.create_table(
-        TableName=ACTIVITY_TABLE,
-        BillingMode="PAY_PER_REQUEST",
-        AttributeDefinitions=[
-            {"AttributeName": "day", "AttributeType": "S"},
-            {"AttributeName": "ts_id", "AttributeType": "S"},
-        ],
-        KeySchema=[
-            {"AttributeName": "day", "KeyType": "HASH"},
-            {"AttributeName": "ts_id", "KeyType": "RANGE"},
-        ],
-    )
-    ddb.get_waiter("table_exists").wait(TableName=ACTIVITY_TABLE)
-
-
-def _scan_all(region: str = "us-east-1") -> list[dict]:
-    table = boto3.resource("dynamodb", region_name=region).Table(ACTIVITY_TABLE)
-    return table.scan().get("Items", [])
+def _missing_provider(name):
+    """Simulates absent containers: every op raises ContainerNotFound."""
+    raise ContainerNotFound(name)
 
 
 # --------------------------------------------------------------------------
-# REDACTION — the BLOCKER-fix proof (no DDB needed — pure function)
+# REDACTION — the BLOCKER-fix proof (no storage needed — pure function)
 # --------------------------------------------------------------------------
 
 def test_sanitize_masks_oddly_named_credential_to_name_only():
@@ -149,80 +126,87 @@ def test_allowlist_excludes_secrets_by_construction():
 
 
 # --------------------------------------------------------------------------
-# LAZY TABLE — constructing against an absent table must never raise
+# LAZY CONTAINER — constructing against absent storage must never raise
 # --------------------------------------------------------------------------
 
-@pytest.mark.skipif(not _HAVE_MOTO, reason="moto not installed")
-def test_lazy_table_ctor_never_raises_on_absent_table(ddb_env):
-    """Constructing an ActivityStore when the table does NOT exist must not
-    touch AWS / raise — the boto3 Table is built on first use (N3)."""
-    with mock_aws():
-        # No table created. Construction is pure.
+def test_lazy_table_ctor_never_raises_on_absent_table():
+    """Constructing an ActivityStore when the container does NOT exist must not
+    touch storage / raise — containers resolve on first use (N3)."""
+    touched: list[str] = []
+    f = FakeCosmos()
+
+    def provider(name):
+        touched.append(name)
+        return f.container(name)
+
+    cosmos.set_container_provider(provider)
+    try:
         store = ActivityStore()
-        assert store._table is None  # not built eagerly
+        assert touched == []  # container not resolved eagerly
+    finally:
+        cosmos.reset_container_provider()
 
 
 # --------------------------------------------------------------------------
 # log() — row shape + ttl
 # --------------------------------------------------------------------------
 
-@pytest.mark.skipif(not _HAVE_MOTO, reason="moto not installed")
-def test_log_writes_row_with_day_ts_id_ttl(ddb_env):
-    with mock_aws():
-        _create_activity_table()
-        store = ActivityStore(ttl_days=90)
-        t0 = time.time()
-        asyncio.run(store.log(
-            actor="admin", actor_role="admin", type="login",
-            target="admin", detail={"username": "admin"},
-        ))
-        rows = _scan_all()
-        assert len(rows) == 1
-        row = rows[0]
-        # day = UTC YYYY-MM-DD
-        assert len(row["day"]) == 10 and row["day"][4] == "-" and row["day"][7] == "-"
-        # ts_id = <epoch_ms>#<uuid-hex>
-        assert "#" in row["ts_id"]
-        epoch_ms, uid = row["ts_id"].split("#", 1)
-        assert epoch_ms.isdigit()
-        uuid.UUID(hex=uid)  # parses → valid uuid hex
-        # ttl ~= now + 90 days (allow a few seconds of slack)
-        expected = int(t0) + 90 * 86400
-        assert abs(int(row["ttl"]) - expected) < 10
-        assert row["actor"] == "admin"
-        assert row["type"] == "login"
-        assert row["status"] == "success"
-        assert row["detail"] == {"username": "admin"}
+def test_log_writes_row_with_day_ts_id_ttl(fake):
+    store = ActivityStore(ttl_days=90)
+    t0 = time.time()
+    asyncio.run(store.log(
+        actor="admin", actor_role="admin", type="login",
+        target="admin", detail={"username": "admin"},
+    ))
+    out = asyncio.run(store.query())
+    assert len(out["items"]) == 1
+    row = out["items"][0]
+    # day = UTC YYYY-MM-DD
+    assert len(row["day"]) == 10 and row["day"][4] == "-" and row["day"][7] == "-"
+    # ts_id = <epoch_ms>#<uuid-hex>
+    assert "#" in row["ts_id"]
+    epoch_ms, uid = row["ts_id"].split("#", 1)
+    assert epoch_ms.isdigit()
+    uuid.UUID(hex=uid)  # parses → valid uuid hex
+    # ttl ~= now + 90 days (allow a few seconds of slack)
+    expected = int(t0) + 90 * 86400
+    assert abs(int(row["ttl"]) - expected) < 10
+    assert row["actor"] == "admin"
+    assert row["type"] == "login"
+    assert row["status"] == "success"
+    assert row["detail"] == {"username": "admin"}
+    # §1.3-2 raw write shape: expires_at=业务删除点；ttl=剩余秒（Cosmos TTL
+    # 按最后修改起算，读侧再曝光 ttl=expires_at 保持外部形狀）
+    raw = next(iter(fake.container("activity").docs.values()))
+    assert abs(raw["expires_at"] - expected) < 10
+    assert raw["ttl"] == 90 * 86400
+    assert raw["id"] == raw["ts_id"]
 
 
-@pytest.mark.skipif(not _HAVE_MOTO, reason="moto not installed")
-def test_log_sanitizes_detail_at_store_layer(ddb_env):
+def test_log_sanitizes_detail_at_store_layer(fake):
     """Even a careless caller passing a raw credential value is sanitized by the
     store-side backstop before the row is written."""
-    with mock_aws():
-        _create_activity_table()
-        store = ActivityStore()
-        asyncio.run(store.log(
-            actor="admin", type="mcp-upsert", target="srv1",
-            detail={"id": "srv1", "url": "https://secret/x", "headers": {"A": "tok"}},
-        ))
-        row = _scan_all()[0]
-        assert row["detail"]["id"] == "srv1"
-        assert row["detail"]["url"] == _MASK
-        assert row["detail"]["headers"] == _MASK
-        assert "secret" not in repr(row["detail"])
+    store = ActivityStore()
+    asyncio.run(store.log(
+        actor="admin", type="mcp-upsert", target="srv1",
+        detail={"id": "srv1", "url": "https://secret/x", "headers": {"A": "tok"}},
+    ))
+    row = asyncio.run(store.query())["items"][0]
+    assert row["detail"]["id"] == "srv1"
+    assert row["detail"]["url"] == _MASK
+    assert row["detail"]["headers"] == _MASK
+    assert "secret" not in repr(row["detail"])
 
 
 # --------------------------------------------------------------------------
-# TABLE-MISSING — best-effort no-op, underlying op unaffected
+# CONTAINER-MISSING — best-effort no-op, underlying op unaffected
 # --------------------------------------------------------------------------
 
-@pytest.mark.skipif(not _HAVE_MOTO, reason="moto not installed")
-def test_log_table_missing_is_silent_noop_and_op_unaffected(ddb_env):
-    """log() against an absent table swallows the error (no raise), and a
+def test_log_table_missing_is_silent_noop_and_op_unaffected():
+    """log() against absent containers swallows the error (no raise), and a
     simulated underlying operation runs to completion regardless."""
-    with mock_aws():
-        # NOTE: table deliberately NOT created.
+    cosmos.set_container_provider(_missing_provider)
+    try:
         store = ActivityStore()
         op_ran = {"done": False}
 
@@ -236,96 +220,91 @@ def test_log_table_missing_is_silent_noop_and_op_unaffected(ddb_env):
         result = asyncio.run(underlying_op())
         assert result == "ok"
         assert op_ran["done"] is True
+    finally:
+        cosmos.reset_container_provider()
 
 
-@pytest.mark.skipif(not _HAVE_MOTO, reason="moto not installed")
-def test_query_table_missing_returns_empty(ddb_env):
-    with mock_aws():
-        store = ActivityStore()  # no table
+def test_query_table_missing_returns_empty():
+    cosmos.set_container_provider(_missing_provider)
+    try:
+        store = ActivityStore()  # no container
         out = asyncio.run(store.query())
         assert out == {"items": [], "cursor": None}
+    finally:
+        cosmos.reset_container_provider()
 
 
 # --------------------------------------------------------------------------
 # query() — filter + newest-first + paginate
 # --------------------------------------------------------------------------
 
-@pytest.mark.skipif(not _HAVE_MOTO, reason="moto not installed")
-def test_query_filters_and_orders_newest_first(ddb_env):
-    with mock_aws():
-        _create_activity_table()
-        store = ActivityStore()
-        # Write several rows on today's partition; spacing the epoch_ms so
-        # ts_id ordering is deterministic.
-        for i in range(5):
-            asyncio.run(store.log(
-                actor=("alice" if i % 2 == 0 else "bob"),
-                type=("login" if i < 3 else "logout"),
-                target=f"t{i}",
-                detail={"username": "alice" if i % 2 == 0 else "bob"},
-            ))
-            time.sleep(0.005)  # ensure distinct epoch_ms
+def test_query_filters_and_orders_newest_first(fake):
+    store = ActivityStore()
+    # Write several rows on today's partition; spacing the epoch_ms so
+    # ts_id ordering is deterministic.
+    for i in range(5):
+        asyncio.run(store.log(
+            actor=("alice" if i % 2 == 0 else "bob"),
+            type=("login" if i < 3 else "logout"),
+            target=f"t{i}",
+            detail={"username": "alice" if i % 2 == 0 else "bob"},
+        ))
+        time.sleep(0.005)  # ensure distinct epoch_ms
 
-        # No filter: all 5, newest-first (descending ts).
-        out = asyncio.run(store.query())
-        items = out["items"]
-        assert len(items) == 5
-        ts_list = [it["ts"] for it in items]
-        assert ts_list == sorted(ts_list, reverse=True), "not newest-first"
+    # No filter: all 5, newest-first (descending ts).
+    out = asyncio.run(store.query())
+    items = out["items"]
+    assert len(items) == 5
+    ts_list = [it["ts"] for it in items]
+    assert ts_list == sorted(ts_list, reverse=True), "not newest-first"
 
-        # Filter by actor.
-        alice = asyncio.run(store.query(actor="alice"))
-        assert {it["actor"] for it in alice["items"]} == {"alice"}
-        assert len(alice["items"]) == 3  # i=0,2,4
+    # Filter by actor.
+    alice = asyncio.run(store.query(actor="alice"))
+    assert {it["actor"] for it in alice["items"]} == {"alice"}
+    assert len(alice["items"]) == 3  # i=0,2,4
 
-        # Filter by type.
-        logout = asyncio.run(store.query(type="logout"))
-        assert {it["type"] for it in logout["items"]} == {"logout"}
-        assert len(logout["items"]) == 2  # i=3,4
+    # Filter by type.
+    logout = asyncio.run(store.query(type="logout"))
+    assert {it["type"] for it in logout["items"]} == {"logout"}
+    assert len(logout["items"]) == 2  # i=3,4
 
 
-@pytest.mark.skipif(not _HAVE_MOTO, reason="moto not installed")
-def test_query_paginates_via_cursor(ddb_env):
-    with mock_aws():
-        _create_activity_table()
-        store = ActivityStore()
-        for i in range(5):
-            asyncio.run(store.log(actor="admin", type="login", target=f"t{i}",
-                                  detail={"username": "admin"}))
-            time.sleep(0.005)
+def test_query_paginates_via_cursor(fake):
+    store = ActivityStore()
+    for i in range(5):
+        asyncio.run(store.log(actor="admin", type="login", target=f"t{i}",
+                              detail={"username": "admin"}))
+        time.sleep(0.005)
 
-        page1 = asyncio.run(store.query(limit=2))
-        assert len(page1["items"]) == 2
-        assert page1["cursor"] is not None
+    page1 = asyncio.run(store.query(limit=2))
+    assert len(page1["items"]) == 2
+    assert page1["cursor"] is not None
 
-        page2 = asyncio.run(store.query(limit=2, cursor=page1["cursor"]))
-        assert len(page2["items"]) == 2
+    page2 = asyncio.run(store.query(limit=2, cursor=page1["cursor"]))
+    assert len(page2["items"]) == 2
 
-        page3 = asyncio.run(store.query(limit=2, cursor=page2["cursor"]))
-        assert len(page3["items"]) == 1
-        assert page3["cursor"] is None
+    page3 = asyncio.run(store.query(limit=2, cursor=page2["cursor"]))
+    assert len(page3["items"]) == 1
+    assert page3["cursor"] is None
 
-        # No row repeated across pages; full set covered; strictly descending.
-        all_ts = [it["ts"] for it in page1["items"] + page2["items"] + page3["items"]]
-        assert len(set(all_ts)) == 5
-        assert all_ts == sorted(all_ts, reverse=True)
+    # No row repeated across pages; full set covered; strictly descending.
+    all_ts = [it["ts"] for it in page1["items"] + page2["items"] + page3["items"]]
+    assert len(set(all_ts)) == 5
+    assert all_ts == sorted(all_ts, reverse=True)
 
 
-@pytest.mark.skipif(not _HAVE_MOTO, reason="moto not installed")
-def test_query_date_range_excludes_out_of_window(ddb_env):
+def test_query_date_range_excludes_out_of_window(fake):
     """A row whose day partition is outside [from,to] is not returned."""
-    with mock_aws():
-        _create_activity_table()
-        store = ActivityStore()
-        asyncio.run(store.log(actor="admin", type="login", detail={"username": "admin"}))
-        # Window entirely in the past (yesterday and before) → no today rows.
-        from datetime import datetime, timezone, timedelta
-        today = datetime.now(timezone.utc)
-        y = (today - timedelta(days=1)).strftime("%Y-%m-%d")
-        past = (today - timedelta(days=5)).strftime("%Y-%m-%d")
-        out = asyncio.run(store.query(day_from=past, day_to=y))
-        assert out["items"] == []
-        # Today included → row appears.
-        td = today.strftime("%Y-%m-%d")
-        out2 = asyncio.run(store.query(day_from=past, day_to=td))
-        assert len(out2["items"]) == 1
+    store = ActivityStore()
+    asyncio.run(store.log(actor="admin", type="login", detail={"username": "admin"}))
+    # Window entirely in the past (yesterday and before) → no today rows.
+    from datetime import datetime, timezone, timedelta
+    today = datetime.now(timezone.utc)
+    y = (today - timedelta(days=1)).strftime("%Y-%m-%d")
+    past = (today - timedelta(days=5)).strftime("%Y-%m-%d")
+    out = asyncio.run(store.query(day_from=past, day_to=y))
+    assert out["items"] == []
+    # Today included → row appears.
+    td = today.strftime("%Y-%m-%d")
+    out2 = asyncio.run(store.query(day_from=past, day_to=td))
+    assert len(out2["items"]) == 1

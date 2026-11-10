@@ -1,7 +1,7 @@
 """WebSocket-based voice bot.
 
 Client pushes 16 kHz PCM16 mono, server streams 24 kHz PCM16 mono back.
-Pipeline: ws_in -> AWS Transcribe -> Bedrock Nova 2 Lite -> MiniMax TTS -> ws_out.
+Pipeline: ws_in -> AWS Transcribe -> Azure AI Foundry LLM -> MiniMax TTS -> ws_out.
 Silero VAD runs in the transport and gates STT / provides barge-in.
 
 Run:
@@ -24,7 +24,6 @@ from typing import Any
 
 import aiohttp
 import boto3
-import secrets as _secrets
 import uvicorn
 from dotenv import load_dotenv
 from fastapi import Cookie, Depends, FastAPI, HTTPException, Query, Request, WebSocket, status
@@ -38,8 +37,10 @@ from pipecat.frames.frames import (
     BotStartedSpeakingFrame,
     BotStoppedSpeakingFrame,
     Frame,
+    FunctionCallFromLLM,
     InputAudioRawFrame,
     InterimTranscriptionFrame,
+    LLMContextFrame,
     LLMFullResponseEndFrame,
     LLMFullResponseStartFrame,
     LLMRunFrame,
@@ -56,6 +57,7 @@ from pipecat.processors.frame_processor import (
     FrameDirection,
     FrameProcessor,
 )
+from pipecat.processors.metrics.frame_processor_metrics import LLMTokenUsage
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
@@ -70,12 +72,12 @@ from pipecat.turns.user_stop.speech_timeout_user_turn_stop_strategy import (
     SpeechTimeoutUserTurnStopStrategy,
 )
 from pipecat.serializers.base_serializer import FrameSerializer
-from pipecat.services.aws.llm import AWSBedrockLLMService
 from pipecat.services.aws.nova_sonic.llm import AWSNovaSonicLLMService
 from pipecat.services.aws.stt import AWSTranscribeSTTService
+from pipecat.services.llm_service import LLMService
 from pipecat.services.minimax.tts import MiniMaxHttpTTSService, MiniMaxTTSSettings
 from pipecat.services.tts_service import TTSService
-from pipecat.services.settings import TTSSettings
+from pipecat.services.settings import LLMSettings, TTSSettings
 from pipecat.frames.frames import ErrorFrame, TTSAudioRawFrame
 from pipecat.utils.tracing.service_decorators import traced_tts
 from asr_filter import (
@@ -96,9 +98,12 @@ from pipecat.transports.websocket.fastapi import (
     FastAPIWebsocketTransport,
 )
 
+from providers.base import ChatMessage, ToolSpec
+from providers.llm.azure_openai import make_managed_llm
 from demo_store import DemoStore
 from voice_store import VoiceStore
 from activity_store import ActivityStore
+from storage.cosmos_calls import CosmosCallRepository
 import twilio_sig  # X-Twilio-Signature verification (T1; stdlib-only)
 from latency_observer import LatencyObserver  # pure-observation latency (T1/T2)
 
@@ -134,7 +139,7 @@ VOICE_STORE = VoiceStore()
 # use (N3), never eagerly — so building it at import time never touches AWS and
 # is safe when the ActivityTable is absent / creds aren't ready. ``log`` is
 # best-effort (swallows all failures incl. table-missing), so shipping this is
-# zero-impact on prod until the table exists + ACTIVITY_TABLE env is set. The
+# zero-impact on prod until the container exists. The
 # lifespan hook does NOT need to prewarm it (no cache). See activity_store.py.
 ACTIVITY_STORE = ActivityStore()
 
@@ -149,15 +154,48 @@ ACTIVITY_STORE = ActivityStore()
 # routes, not an import-time crash.
 COOKIE_NAME = "vb_session"
 
-# Session JWT secret. If AUTH_SECRET is unset we generate a random one at
-# startup (with a WARNING) so the app still boots — but every restart then
-# invalidates all sessions, so prod MUST set AUTH_SECRET explicitly.
-AUTH_SECRET = os.environ.get("AUTH_SECRET", "").strip()
+# --- Startup secret resolution (CR-C1 / B-5①, spec §3.2) -----------------
+def _kv_secret(secret_name: str) -> str:
+    """§3.2 MI 直读兜底通道（Key Vault Secrets User，§5 #3）。只驻内存——不落
+    盘、不进 config。SDK 未装/不可达 → ""（主通道=Container Apps secretRef env 注入）。"""
+    vault_url = (os.environ.get("KEY_VAULT_URL") or "").strip()
+    if not vault_url:
+        return ""
+    try:
+        from azure.identity import DefaultAzureCredential
+        from azure.keyvault.secrets import SecretClient
+
+        client = SecretClient(vault_url=vault_url, credential=DefaultAzureCredential())
+        return (client.get_secret(secret_name).value or "").strip()
+    except Exception as e:
+        logger.warning(f"Key Vault secret {secret_name!r} unresolved: {e}")
+        return ""
+
+
+def resolve_secret(env_name: str, kv_secret_name: str) -> str:
+    """B-5① 启动期取密钥（§3.2「啟動期取密鑰」语义，对应旧 UserData 路径）：
+    env（secretRef 注入/本地测试缝）优先，缺则 §3.1 冻结 secret 名 MI 直读。"""
+    return (os.environ.get(env_name) or "").strip() or _kv_secret(kv_secret_name)
+
+
+def resolve_api_keys() -> dict:
+    """CR-C1 注入缝取值：build_cascade_engine(speech_api_key=…, llm_api_key=…,
+    minimax_api_key=…) 的启动期解析源。speech/llm 无 §3.1 KV secret 名（名单
+    冻结，补名属 CR 裁定）→ env 直给，缺省空串=MI 模式。"""
+    return {
+        "speech_api_key": (os.environ.get("SPEECH_KEY") or "").strip(),
+        "llm_api_key": (os.environ.get("LLM_API_KEY") or "").strip(),
+        "minimax_api_key": resolve_secret("MINIMAX_API_KEY", "MINIMAX-API-KEY"),
+    }
+
+
+# Session JWT secret. B12（BC-c3 裁决）：AUTH_SECRET 入 Vault（§3.1 AUTHSECRET），
+# ephemeral fallback 退役——缺值 fail-fast（旧行为 token_urlsafe(48) 随机生成+告警已删）。
+AUTH_SECRET = resolve_secret("AUTH_SECRET", "AUTHSECRET")
 if not AUTH_SECRET:
-    AUTH_SECRET = _secrets.token_urlsafe(48)
-    logger.warning(
-        "AUTH_SECRET not set; generated an ephemeral one. All sessions will be "
-        "invalidated on restart. Set AUTH_SECRET in the environment for prod."
+    raise RuntimeError(
+        "AUTH_SECRET missing: inject env AUTH_SECRET (secretRef) or Key Vault "
+        "'AUTHSECRET' — B12 fail-fast, ephemeral fallback retired"
     )
 AUTH_TTL_HOURS = int(os.environ.get("AUTH_TTL_HOURS", "12"))
 _JWT_ALG = "HS256"
@@ -299,6 +337,12 @@ PHONE_WIRE_SAMPLE_RATE = 8000
 # ``stt`` is therefore typed ``Language | None``; every pipeline code path that
 # reads it must tolerate / never reach None (validation blocks pipeline + a
 # stt=None language; build_pipeline_task is additionally defensive).
+#
+# Decision (a) / C-3 (ruling B 2026-11-09): nova-sonic left the selectable
+# engine set (ENGINES below), so the 8 Nova-only entries carry ``engines: []``
+# — Voice-Live-gated: no engine claims them until the future Azure Voice Live
+# (FC-5, VOICE_LIVE_ENABLED) adds its name. en-US keeps its historical dual
+# list untouched (A-3: zero product change for the working languages).
 LANGUAGES: dict[str, dict] = {
     "zh-HK": {
         "label": "粵語 (Cantonese)",
@@ -359,14 +403,17 @@ LANGUAGES: dict[str, dict] = {
         ),
         "greeting": "Greet the user in Singapore English in one sentence and briefly introduce yourself.",
     },
-    # --- Nova Sonic-only languages (stt=None, engines=["nova-sonic"]) -------
-    # These exist purely to widen Nova's selectable language set; they never
-    # enter the pipeline path (no Transcribe LanguageCode). prompt/greeting are
-    # written in-language, matching the voice-assistant tone of the 5 above.
+    # --- Nova Sonic-only languages (stt=None, engines=[]) ------------------
+    # Decision (a) / C-3 (ruling B 2026-11-09): retired from the phone default
+    # and selectable surfaces via engines=[] — Voice-Live-gated: no engine
+    # claims them until the future Azure Voice Live slot (FC-5) adds its name.
+    # Entries are NOT deleted (discovery (a)): prompt/greeting stay in-language
+    # for that future use. They never entered the pipeline path (no Transcribe
+    # LanguageCode).
     "en-GB": {
         "label": "English (UK)",
         "stt": None,
-        "engines": ["nova-sonic"],
+        "engines": [],
         "prompt": (
             "You are a friendly voice assistant speaking British English. Your replies "
             "will be spoken aloud, so avoid emojis, bullet points, or any written "
@@ -377,7 +424,7 @@ LANGUAGES: dict[str, dict] = {
     "en-AU": {
         "label": "English (Australia)",
         "stt": None,
-        "engines": ["nova-sonic"],
+        "engines": [],
         "prompt": (
             "You are a friendly voice assistant speaking Australian English. Your replies "
             "will be spoken aloud, so avoid emojis, bullet points, or any written "
@@ -388,7 +435,7 @@ LANGUAGES: dict[str, dict] = {
     "en-IN": {
         "label": "English (India)",
         "stt": None,
-        "engines": ["nova-sonic"],
+        "engines": [],
         "prompt": (
             "You are a friendly voice assistant speaking Indian English. Your replies "
             "will be spoken aloud, so avoid emojis, bullet points, or any written "
@@ -399,7 +446,7 @@ LANGUAGES: dict[str, dict] = {
     "fr-FR": {
         "label": "Français",
         "stt": None,
-        "engines": ["nova-sonic"],
+        "engines": [],
         "prompt": (
             "Vous êtes un assistant vocal amical. Vos réponses seront lues à voix haute, "
             "donc évitez les emojis, les listes à puces ou toute mise en forme écrite. "
@@ -410,7 +457,7 @@ LANGUAGES: dict[str, dict] = {
     "it-IT": {
         "label": "Italiano",
         "stt": None,
-        "engines": ["nova-sonic"],
+        "engines": [],
         "prompt": (
             "Sei un assistente vocale amichevole. Le tue risposte verranno lette ad alta voce, "
             "quindi evita emoji, elenchi puntati o qualsiasi formattazione scritta. "
@@ -421,7 +468,7 @@ LANGUAGES: dict[str, dict] = {
     "de-DE": {
         "label": "Deutsch",
         "stt": None,
-        "engines": ["nova-sonic"],
+        "engines": [],
         "prompt": (
             "Du bist ein freundlicher Sprachassistent. Deine Antworten werden vorgelesen, "
             "vermeide daher Emojis, Aufzählungspunkte oder jegliche schriftliche Formatierung. "
@@ -432,7 +479,7 @@ LANGUAGES: dict[str, dict] = {
     "es-US": {
         "label": "Español (US)",
         "stt": None,
-        "engines": ["nova-sonic"],
+        "engines": [],
         "prompt": (
             "Eres un asistente de voz amigable. Tus respuestas se leerán en voz alta, "
             "así que evita emojis, listas con viñetas o cualquier formato escrito. "
@@ -443,7 +490,7 @@ LANGUAGES: dict[str, dict] = {
     "pt-BR": {
         "label": "Português (BR)",
         "stt": None,
-        "engines": ["nova-sonic"],
+        "engines": [],
         "prompt": (
             "Você é um assistente de voz amigável. Suas respostas serão lidas em voz alta, "
             "então evite emojis, listas com marcadores ou qualquer formatação escrita. "
@@ -462,22 +509,31 @@ def _languages_for_engine(engine: str) -> list[str]:
     """
     return [k for k, v in LANGUAGES.items() if engine in v.get("engines", [])]
 
-# LLMs selectable from the UI. Values are Bedrock inference-profile IDs.
-# Anthropic Claude on Bedrock requires inference profiles (us.* / global.*) —
-# bare anthropic.* IDs return ValidationException ("on-demand throughput isn't
-# supported"). Stack lives in us-east-1, so we use us.* for lowest latency.
+# LLMs selectable from the UI. Keys are stable selection IDs (frozen, C-2).
+# Values are Azure AI Foundry model names — 失實值原則（裁決 A-1）：struct["model"]
+# 落史數據、UI label、能力位 claude-*/gpt-* 匹配，三者都要真實模型名而非部署別名。
+# 模型名→部署的解析歸 FC-3 適配器內部（LLM_* 契約變量），不在此層。
 MODELS: dict[str, str] = {
-    "nova-2-lite":       "us.amazon.nova-2-lite-v1:0",
-    "nova-lite":         "us.amazon.nova-lite-v1:0",
-    "nova-micro":        "us.amazon.nova-micro-v1:0",
-    "claude-haiku-4.5":  "us.anthropic.claude-haiku-4-5-20251001-v1:0",
-    "claude-sonnet-4.5": "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
-    "claude-sonnet-4.6": "us.anthropic.claude-sonnet-4-6",
+    "nova-2-lite":       "gpt-4.1-mini",
+    "nova-lite":         "gpt-5-mini",
+    "nova-micro":        "gpt-4.1-nano",
+    "claude-haiku-4.5":  "claude-haiku-4-5",
+    "claude-sonnet-4.5": "claude-sonnet-4-5",
+    "claude-sonnet-4.6": "claude-sonnet-4-6",
+}
+
+# UI 顯示名（B9：顯示真實模型名是正確性問題，掛舊名=誤標缺陷；用戶已簽
+# 2026-11-09 同意改名，凍結回退=兩處 payload label 一行恢復取 key）。
+LABELS: dict[str, str] = {
+    "nova-2-lite":       "GPT-4.1 mini",
+    "nova-lite":         "GPT-5 mini",
+    "nova-micro":        "GPT-4.1 nano",
+    "claude-haiku-4.5":  "Claude Haiku 4.5",
+    "claude-sonnet-4.5": "Claude Sonnet 4.5",
+    "claude-sonnet-4.6": "Claude Sonnet 4.6",
 }
 
 
-def _is_claude_model_id(model_id: str) -> bool:
-    return ".anthropic." in model_id
 DEFAULT_LANG = "en-US"
 DEFAULT_MODEL = "nova-2-lite"
 # Demo prompt translation (admin one-click translate) is a quality-sensitive
@@ -721,8 +777,10 @@ class SimpleMiniMaxTTSService(MiniMaxHttpTTSService):
                             usage_started = True
                         await self.stop_ttfb_metrics()
 
-                        # Re-slice incoming PCM into Pipecat's preferred chunk size
-                        # (20 ms @ 24 kHz = 960 bytes) so downstream pacing stays smooth.
+                        # Re-slice incoming PCM to the wheel TTSService chunk_size
+                        # (tts_service.py:417: 0.5 s of audio per chunk = sample_rate
+                        # x 0.5 x 2 bytes; at 24 kHz that is 24000 bytes). `or 960` is
+                        # only a historical fallback if the property is unset.
                         chunk_bytes = self.chunk_size or 960
                         for i in range(0, len(pcm), chunk_bytes):
                             yield TTSAudioRawFrame(
@@ -871,40 +929,29 @@ MINIMAX_MODELS: dict[str, str] = {
 }
 DEFAULT_MINIMAX_MODEL = os.environ.get("MINIMAX_MODEL_DEFAULT", "speech-2.8-turbo")
 
-# Nova Sonic v2 voices (lowercase). See:
-# https://docs.aws.amazon.com/nova/latest/nova2-userguide/sonic-language-support.html
-NOVA_SONIC_VOICES: dict[str, dict] = {
-    # locale en-US — tiffany/matthew are polyglot (can speak all 7 supported languages)
-    "tiffany":  {"label": "Tiffany",  "gender": "F", "locale": "en-US", "lang_label": "English (US)", "polyglot": True},
-    "matthew":  {"label": "Matthew",  "gender": "M", "locale": "en-US", "lang_label": "English (US)", "polyglot": True},
-    "amy":      {"label": "Amy",      "gender": "F", "locale": "en-GB", "lang_label": "English (UK)"},
-    "olivia":   {"label": "Olivia",   "gender": "F", "locale": "en-AU", "lang_label": "English (AU)"},
-    "kiara":    {"label": "Kiara",    "gender": "F", "locale": "en-IN", "lang_label": "English (IN) / Hindi"},
-    "arjun":    {"label": "Arjun",    "gender": "M", "locale": "en-IN", "lang_label": "English (IN) / Hindi"},
-    "ambre":    {"label": "Ambre",    "gender": "F", "locale": "fr-FR", "lang_label": "Français"},
-    "florian":  {"label": "Florian",  "gender": "M", "locale": "fr-FR", "lang_label": "Français"},
-    "beatrice": {"label": "Beatrice", "gender": "F", "locale": "it-IT", "lang_label": "Italiano"},
-    "lorenzo":  {"label": "Lorenzo",  "gender": "M", "locale": "it-IT", "lang_label": "Italiano"},
-    "tina":     {"label": "Tina",     "gender": "F", "locale": "de-DE", "lang_label": "Deutsch"},
-    "lennart":  {"label": "Lennart",  "gender": "M", "locale": "de-DE", "lang_label": "Deutsch"},
-    "lupe":     {"label": "Lupe",     "gender": "F", "locale": "es-US", "lang_label": "Español (US)"},
-    "carlos":   {"label": "Carlos",   "gender": "M", "locale": "es-US", "lang_label": "Español (US)"},
-    "carolina": {"label": "Carolina", "gender": "F", "locale": "pt-BR", "lang_label": "Português (BR)"},
-    "leo":      {"label": "Leo",      "gender": "M", "locale": "pt-BR", "lang_label": "Português (BR)"},
-}
-# Migration map for old voice ids that are NOT in the official Nova 2 Sonic list
-# (these may still live in runtime.json or bookmarked /ws?voice= links — keep them working).
-NOVA_SONIC_VOICE_ALIASES = {"marie": "ambre", "sofia": "lupe", "ana": "carolina"}
-DEFAULT_NOVA_SONIC_VOICE = "tiffany"
+# Nova Sonic v2 voices (lowercase) — EMPTIED per decision (a) / C-3 (ruling B
+# 2026-11-09): "the baseline ships without Nova Sonic", ``nova_sonic_voices``
+# becomes empty. /api/config keeps the key (shape frozen — B9/B11 discipline)
+# with empty content. The 16-voice roster, alias map and default below are in
+# git history: restore them together with ENGINES to take the AWS rollback
+# path (that code path is untouched). DEFAULT/aliases are emptied alongside so
+# the trio stays consistent — nothing resolves to a ghost voice id.
+NOVA_SONIC_VOICES: dict[str, dict] = {}
+NOVA_SONIC_VOICE_ALIASES: dict[str, str] = {}
+DEFAULT_NOVA_SONIC_VOICE = ""  # invalidated (C-3 清空/失效), consistent with the emptied table
 
 # Conversation engine:
 #   - "pipeline": STT (Transcribe) + LLM (Bedrock) + TTS (MiniMax/Polly)
-#   - "nova-sonic": one end-to-end speech-to-speech model (Nova 2 Sonic)
+# nova-sonic is dropped from the selectable set — decision (a) / C-3 (ruling B
+# 2026-11-09): `engines[]` -> [pipeline] only. Its code path
+# (_build_nova_sonic_pipeline etc.) is untouched and stays as the AWS rollback
+# route: restore this table + the voice table above from git history to roll
+# back. DEFAULT_ENGINE also feeds PHONE_ENGINE's fallback (decision (a): the
+# nova-sonic default was the "Azure path silently calls AWS" footgun).
 ENGINES: dict[str, str] = {
     "pipeline":   "Pipeline (STT+LLM+TTS)",
-    "nova-sonic": "Nova Sonic v2 (S2S)",
 }
-DEFAULT_ENGINE = "nova-sonic"
+DEFAULT_ENGINE = "pipeline"
 
 # Pipeline mode is strictly turn-based: the LLM only runs when a user turn
 # arrives. If the bot ends its reply announcing it will continue ("請稍等" /
@@ -1221,12 +1268,13 @@ def session_emits(call_id: str) -> list[EmitFn]:
     return list(sess["emits"]) if sess else []
 
 
-# --- Call history persistence (DynamoDB) ----------------------------------
-# Phone calls only. Browser /ws does not persist. HISTORY_TABLE empty or
-# HISTORY_DISABLED=1 ⇒ _history is None and every call site is a no-op.
-HISTORY_TABLE = os.environ.get("HISTORY_TABLE", "").strip()
+# --- Call history persistence (Cosmos, infra-spec §1.1) --------------------
+# Phone calls only. Browser /ws does not persist. HISTORY_DISABLED=1 ⇒ _history
+# is None and every call site is a no-op. B10（BC-c1）：HISTORY_TABLE 退役——
+# 连线由 COSMOS_ENDPOINT/COSMOS_DATABASE + DefaultAzureCredential 解析（CR-C1），
+# 容器名 §1.1 冻结；开关=HISTORY_DISABLED（discovery 依赖矩阵 keep）。
 HISTORY_TTL_DAYS = int(os.environ.get("HISTORY_TTL_DAYS", "30"))
-HISTORY_DISABLED = os.environ.get("HISTORY_DISABLED", "0") == "1" or not HISTORY_TABLE
+HISTORY_DISABLED = os.environ.get("HISTORY_DISABLED", "0") == "1"
 HISTORY_BUFFERS: dict[str, list[dict]] = {}
 
 # Phone-leg LLM tool registration (end_call / transfer_to_human). Default ON.
@@ -1234,44 +1282,48 @@ HISTORY_BUFFERS: dict[str, list[dict]] = {}
 PHONE_TOOLS_ENABLED = os.environ.get("PHONE_TOOLS_ENABLED", "1").strip() not in ("", "0", "false", "False")
 
 
-def _to_ddb(value):
-    """Recursively convert Python floats to Decimal so the DynamoDB resource
-    layer accepts them. Lists / dicts are walked in place; other scalars are
-    returned unchanged."""
-    from decimal import Decimal
+def _summary_job(call_id: str) -> dict:
+    """§2.2 job 信封（MessageId=job_id 由發佈方 set）：job_type 判別，
+    summary 現在；approved artifacts 未來同隊列（F8 最小集）。"""
+    return {"job_type": "summary", "job_id": f"summary:{call_id}", "call_id": call_id}
 
-    if isinstance(value, float):
-        # str() round-trips through Decimal cleanly; passing the float directly
-        # produces noisy artifacts like 0.10000000000000000555…
-        return Decimal(str(value))
-    if isinstance(value, list):
-        return [_to_ddb(v) for v in value]
-    if isinstance(value, dict):
-        return {k: _to_ddb(v) for k, v in value.items()}
-    return value
+
+def _servicebus_sink():
+    """B-3 投遞縫解析（§2.2）：SERVICEBUS_NAMESPACE 配置 → postcall-jobs 隊列
+    發佈器；未配置 → None（呼叫方走 in-process 降級=現行為，dev/test 兼容）。
+    解析留呼叫時（env / 測試縫可晚注入）；發送失敗由呼叫方定性。"""
+    if not (os.environ.get("SERVICEBUS_NAMESPACE") or "").strip():
+        return None
+    from storage import servicebus
+
+    def send(job: dict) -> None:
+        servicebus.get_queue(servicebus.POSTCALL_QUEUE).send(
+            message_id=job["job_id"], body=job
+        )
+
+    return send
 
 
 class HistoryRecorder:
-    """Buffers final transcript turns + meta per call, flushes to DynamoDB
-    on finalize(), then schedules an async Bedrock summary that updates the
-    same row in place.
+    """Buffers final transcript turns + meta per call, flushes to Cosmos on
+    end-of-call (flush_turns_and_summarize), then dispatches the summary job.
 
     Methods:
-        attach(call_id, session_meta) — initialize buffer + meta snapshot.
-        append(call_id, turn)         — append one final turn (sync).
-        async finalize(call_id)       — drain + put_item, schedule summary.
+        attach(call_id, session_meta)            — initialize buffer + meta snapshot.
+        append(call_id, turn)                    — append one final turn (sync).
+        append_event(call_id, kind, data)        — record a non-transcript event.
+        mark_transfer(call_id, topic)            — flag human follow-up.
+        async write_outcome_row(call_id)         — persist outcome row (pre-BYE).
+        async flush_turns_and_summarize(call_id) — drain + persist, dispatch summary.
+        async finalize(call_id)                  — 前者 API 面兼容薄封裝（#17 修法①）。
     """
 
-    def __init__(self, table_name: str, region: str, ttl_days: int):
-        self._table_name = table_name
-        self._region = region
-        self._ttl_days = ttl_days
+    def __init__(self, repo, *, summary_sink=None):
+        self._repo = repo
         self._meta: dict[str, dict] = {}
-        # Sync boto3 resource invoked via asyncio.to_thread for two reasons:
-        # (1) moto's test fixture patches botocore (sync) cleanly but breaks
-        # against aiobotocore in this version pair; (2) post-call DDB writes
-        # are infrequent enough that the thread-pool hop is negligible.
-        self._table = boto3.resource("dynamodb", region_name=region).Table(table_name)
+        # B-3 投遞縫：summary_sink(job) 注入 Service Bus 發佈器；默認 None =
+        # in-process（現行為）。job 信封契約見 _dispatch_summary。
+        self._summary_sink = summary_sink
 
     def attach(self, call_id: str, session_meta: dict) -> None:
         HISTORY_BUFFERS.setdefault(call_id, [])
@@ -1289,8 +1341,8 @@ class HistoryRecorder:
 
     def mark_transfer(self, call_id: str, topic: str) -> None:
         """Flag this call as needing human follow-up. Persisted as top-level
-        ``transfer_requested`` / ``transfer_topic`` columns by ``finalize`` so a
-        callback queue can Query the table without scanning the turns array."""
+        ``transfer_requested`` / ``transfer_topic`` columns by ``write_outcome_row``
+        so a callback queue can query the table without scanning the turns."""
         meta = self._meta.get(call_id)
         if meta is None:
             return
@@ -1299,12 +1351,14 @@ class HistoryRecorder:
 
     async def write_outcome_row(self, call_id: str) -> bool:
         """Persist the minimal fields a downstream Connect Flow Lambda needs
-        (caller, transfer_requested, transfer_topic, timestamps, TTL).
+        (caller, transfer_requested, transfer_topic, timestamps).
 
         Awaited synchronously by the LLM tool handlers BEFORE BYE goes out so
         the row exists by the time Connect resumes its Flow. Idempotent via
         meta["_outcome_written"]; safe to call again from
         flush_turns_and_summarize for the remote-hangup path.
+        ttl/expires_at 由 repo 按 §1.3 統一計算（started_at + HISTORY_TTL_DAYS
+        為業務邊界；剩餘 TTL 寫側重算）。
         """
         meta = self._meta.get(call_id)
         if meta is None:
@@ -1313,15 +1367,15 @@ class HistoryRecorder:
             return True
         started_at = float(meta.get("started_at") or time.time())
         ended_at = time.time()
-        ttl = int(started_at + self._ttl_days * 86400)
         item = {
             "call_id": call_id,
             "caller": meta.get("caller") or "unknown",
+            # PK /caller_id（§1.1）：匿名呼叫者落哨兵 "_none_"
+            "caller_id": meta.get("caller") or "_none_",
             "started_at": int(started_at),
             "ended_at": int(ended_at),
             "duration_s": int(max(0, ended_at - started_at)),
             "summary_status": "pending",
-            "ttl": ttl,
             # Always written so downstream consumers (e.g. Connect Flow
             # Lambda) can read item["transfer_requested"] without a fallback.
             "transfer_requested": bool(meta.get("transfer_requested")),
@@ -1333,7 +1387,7 @@ class HistoryRecorder:
         }
         t0 = time.monotonic()
         try:
-            await asyncio.to_thread(self._table.put_item, Item=_to_ddb(item))
+            await asyncio.to_thread(self._repo.upsert_outcome_doc, item)
         except Exception as e:
             logger.warning(f"history outcome put_item failed for {call_id}: {e}")
             return False
@@ -1348,9 +1402,8 @@ class HistoryRecorder:
 
     async def flush_turns_and_summarize(self, call_id: str) -> None:
         """Post-BYE flush: ensure the outcome row exists (remote-hangup path),
-        UPDATE it with turns + scenario meta, then schedule the Bedrock
-        summary in the background. Uses update_item (SET) so it never
-        overwrites the outcome fields a Connect Lambda may already be reading.
+        persist turns（X1：文本輪次→transcripts、tool_call 事件→call_events）
+        + scenario meta，然後投遞摘要任務（B-3 投遞縫）。
         """
         # Cover the remote-hangup path where the LLM tool was never called.
         # write_outcome_row is idempotent so the tool path pays no extra cost.
@@ -1360,28 +1413,20 @@ class HistoryRecorder:
         meta = self._meta.pop(call_id, None)
         if meta is None:
             return
-        update_kwargs = {
-            "Key": {"call_id": call_id},
-            "UpdateExpression": (
-                "SET turns = :t, turn_count = :n, lang = :lang, engine = :eng, "
-                "scenario = :sc, provider = :prov, voice = :v, model = :m, "
-                "minimax_model = :mm"
-            ),
-            "ExpressionAttributeValues": _to_ddb({
-                ":t": turns,
-                ":n": len(turns),
-                ":lang": meta.get("lang") or "",
-                ":eng": meta.get("engine") or "",
-                ":sc": meta.get("scenario") or "",
-                ":prov": meta.get("provider") or "",
-                ":v": meta.get("voice") or "",
-                ":m": meta.get("model") or "",
-                ":mm": meta.get("minimax_model") or "",
-            }),
+        fields = {
+            "turn_count": len(turns),
+            "lang": meta.get("lang") or "",
+            "engine": meta.get("engine") or "",
+            "scenario": meta.get("scenario") or "",
+            "provider": meta.get("provider") or "",
+            "voice": meta.get("voice") or "",
+            "model": meta.get("model") or "",
+            "minimax_model": meta.get("minimax_model") or "",
         }
         t0 = time.monotonic()
         try:
-            await asyncio.to_thread(self._table.update_item, **update_kwargs)
+            await asyncio.to_thread(self._repo.write_turns, call_id, turns)
+            await asyncio.to_thread(self._repo.patch_fields, call_id, fields)
         except Exception as e:
             logger.warning(f"history turns update_item failed for {call_id}: {e}")
             return
@@ -1390,6 +1435,25 @@ class HistoryRecorder:
             f"history turns flushed call_id={call_id} "
             f"turns={len(turns)} latency_ms={latency_ms}"
         )
+        self._dispatch_summary(call_id, turns, meta)
+
+    async def finalize(self, call_id: str) -> None:
+        """API 面兼容薄封裝（#17 續跑令修法①）：收口面就是
+        flush_turns_and_summarize，保留舊名、不複製流程。"""
+        await self.flush_turns_and_summarize(call_id)
+
+    def _dispatch_summary(self, call_id: str, turns: list, meta: dict) -> None:
+        # B-3 投遞縫（§2.2）：job 信封見 _summary_job，MessageId=job_id。
+        # 未配置 Service Bus 時 in-process（現行為）；投遞 at-most-once
+        # fire-and-forget（§2.2，進程崩潰仍可能丟——outbox 不預建），
+        # 發送失敗只記日誌不阻斷 teardown，行留 pending 由 U-406 清掃。
+        sink = self._summary_sink if self._summary_sink is not None else _servicebus_sink()
+        if sink is not None:
+            try:
+                sink(_summary_job(call_id))
+            except Exception:
+                logger.exception(f"summary job enqueue failed for {call_id}")
+            return
         asyncio.create_task(self._summarize_and_update(call_id, turns, meta))
 
     async def _summarize_and_update(
@@ -1397,26 +1461,19 @@ class HistoryRecorder:
     ) -> None:
         lang = meta.get("lang") or DEFAULT_LANG
         try:
+            # 30s 預算：B-3 後移 worker 側原值（§2.2）
             struct = await asyncio.wait_for(
                 _invoke_summary_bedrock(turns, lang), timeout=30.0
             )
-            update_kwargs = {
-                "Key": {"call_id": call_id},
-                "UpdateExpression": "SET summary = :s, summary_status = :ok",
-                "ExpressionAttributeValues": {":s": _to_ddb(struct), ":ok": "ok"},
-            }
+            fields = {"summary": struct, "summary_status": "ok"}
         except Exception as e:
             logger.warning(f"history summary failed for {call_id}: {e}")
-            update_kwargs = {
-                "Key": {"call_id": call_id},
-                "UpdateExpression": "SET summary_status = :f, summary_error = :e",
-                "ExpressionAttributeValues": {
-                    ":f": "failed",
-                    ":e": str(e)[:500],
-                },
+            fields = {
+                "summary_status": "failed",
+                "summary_error": str(e)[:500],
             }
         try:
-            await asyncio.to_thread(self._table.update_item, **update_kwargs)
+            await asyncio.to_thread(self._repo.patch_fields, call_id, fields)
         except Exception as e:
             logger.warning(f"history update_item failed for {call_id}: {e}")
 
@@ -1425,22 +1482,17 @@ _history: HistoryRecorder | None = (
     None
     if HISTORY_DISABLED
     else HistoryRecorder(
-        table_name=HISTORY_TABLE,
-        # DynamoDB lives in the DEPLOY region, which can differ from AWS_REGION
-        # (the Bedrock region). DDB_REGION falls back to AWS_REGION, so a
-        # single-region deploy (the common case) is unchanged.
-        region=os.environ.get("DDB_REGION") or os.environ.get("AWS_REGION", "us-east-1"),
-        ttl_days=HISTORY_TTL_DAYS,
+        repo=CosmosCallRepository(ttl_days=HISTORY_TTL_DAYS),
     )
 )
 if _history is None:
     logger.info(
-        f"history persistence disabled (HISTORY_TABLE={HISTORY_TABLE!r} "
-        f"HISTORY_DISABLED={os.environ.get('HISTORY_DISABLED','0')})"
+        f"history persistence disabled (HISTORY_DISABLED="
+        f"{os.environ.get('HISTORY_DISABLED','0')})"
     )
 else:
     logger.info(
-        f"history persistence enabled: table={HISTORY_TABLE} ttl_days={HISTORY_TTL_DAYS}"
+        f"history persistence enabled: cosmos calls ttl_days={HISTORY_TTL_DAYS}"
     )
 
 
@@ -1786,8 +1838,15 @@ def _build_tts(
         voice=voice_id,
     )
     tts_settings.language_boost = language_boost
+    # CR-C1 注入缝收编：env（secretRef）→ §3.1 MINIMAX-API-KEY；缺值指名注入通道
+    minimax_api_key = resolve_secret("MINIMAX_API_KEY", "MINIMAX-API-KEY")
+    if not minimax_api_key:
+        raise RuntimeError(
+            "MiniMax api key missing: inject env MINIMAX_API_KEY (secretRef) or "
+            "Key Vault 'MINIMAX-API-KEY' (CR-C1 injection seam)"
+        )
     return SimpleMiniMaxTTSService(
-        api_key=os.environ["MINIMAX_API_KEY"],
+        api_key=minimax_api_key,
         group_id=os.environ.get("MINIMAX_GROUP_ID", ""),
         base_url=os.environ.get("MINIMAX_BASE_URL", "https://api.minimax.chat/v1/t2a_v2"),
         aiohttp_session=aio_session,
@@ -2299,6 +2358,88 @@ async def _build_nova_sonic_pipeline(
     return task
 
 
+def _fc3_tool_specs(tools_schema) -> list[ToolSpec] | None:
+    """LLMContext 的 ToolsSchema → FC-3 ToolSpec（橋接邊界翻譯，providers/base 凍結不動）。"""
+    if not tools_schema:
+        return None
+    return [
+        ToolSpec(
+            name=fs.name,
+            description=fs.description,
+            parameters_schema=fs.to_default_dict()["parameters"],
+        )
+        for fs in tools_schema.standard_tools
+    ] or None
+
+
+class _FC3PipecatLLM(LLMService):
+    """FC-3→pipecat 橋接（裁決 A-3 案 (ii)，仿 _MultiLangTranscribeSTT 先例）。
+
+    pipecat 管線消費 LLMService 幀機器，FC-3 是凍結契約面（providers/base）——
+    橋接把 LLMContext 經 OpenAILLMAdapter 攤成 OpenAI 形消息（FC-3 raw 直通收
+    下），FC-3 事件流翻回幀序：delta→LLMTextFrame 流、tool_request→
+    FunctionCallFromLLM→run_function_calls、usage→計量。F3/F5/F6（重試預算/
+    caching 能力位/max_tokens 參數名）單一事實源留在 FC-3 適配器，橋接零重複。
+    """
+
+    def __init__(self, *, llm: Any, system_instruction: str, max_tokens: int) -> None:
+        super().__init__(
+            settings=LLMSettings(system_instruction=system_instruction, max_tokens=max_tokens)
+        )
+        self._llm = llm
+        self._system_instruction = system_instruction
+        self._max_tokens = max_tokens
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
+        await super().process_frame(frame, direction)
+        if isinstance(frame, LLMContextFrame):
+            try:
+                await self.push_frame(LLMFullResponseStartFrame())
+                await self.start_processing_metrics()
+                await self._process_context(frame.context)
+            except Exception as e:
+                await self.push_error(error_msg=f"Azure OpenAI completion error: {e}", exception=e)
+            finally:
+                await self.stop_processing_metrics()
+                await self.push_frame(LLMFullResponseEndFrame())
+        else:
+            await self.push_frame(frame, direction)
+
+    async def _process_context(self, context: LLMContext) -> None:
+        params = self.get_llm_adapter().get_llm_invocation_params(
+            context,
+            system_instruction=self._system_instruction,
+            convert_developer_to_user=True,  # Azure 兼容面無 developer role
+        )
+        calls: list[FunctionCallFromLLM] = []
+        await self.start_ttfb_metrics()
+        async for ev in self._llm.stream(
+            messages=params["messages"],
+            tools=_fc3_tool_specs(context.tools),
+            max_tokens=self._max_tokens,
+        ):
+            if ev.kind == "delta" and ev.text:
+                await self.stop_ttfb_metrics()
+                await self._push_llm_text(ev.text)
+            elif ev.kind == "tool_request":
+                tr = ev.tool_request
+                calls.append(FunctionCallFromLLM(
+                    context=context, tool_call_id=tr.id, function_name=tr.name,
+                    arguments=tr.arguments,
+                ))
+            elif ev.kind == "usage":
+                u = ev.usage
+                cached = (u.raw or {}).get("prompt_tokens_details") or {}
+                await self.start_llm_usage_metrics(LLMTokenUsage(
+                    prompt_tokens=u.input_units,
+                    completion_tokens=u.output_units,
+                    total_tokens=u.input_units + u.output_units,
+                    cache_read_input_tokens=cached.get("cached_tokens"),
+                ))
+        if calls:
+            await self.run_function_calls(calls)
+
+
 async def _build_pipeline(
     websocket: WebSocket,
     lang_key: str,
@@ -2368,22 +2509,13 @@ async def _build_pipeline(
         settings=AWSTranscribeSTTService.Settings(language=lang["stt"]),
     )
 
-    llm_settings = AWSBedrockLLMService.Settings(
-        model=model_id,
+    # LLM 側 MI（裁決 A-3 耦合旗 B5/V4）：無密鑰；STT 側凍結憑證另案（Transcribe
+    # 調用面歸 U-101）。F3/F5/F6（重試預算/caching 能力位/max_tokens 參數名）事實
+    # 源在 FC-3 適配器；max_tokens=256 為 F6 對話原值。
+    llm = _FC3PipecatLLM(
+        llm=make_managed_llm(model=model_id),
         system_instruction=system_prompt,
         max_tokens=256,
-    )
-    if _is_claude_model_id(model_id):
-        # Claude on Bedrock honors cachePoint markers; cuts TTFT ~85% on multi-turn
-        # conversations where the system prompt (KB seed) stays constant. Nova
-        # rejects cachePoint with a 400, so we keep this Claude-only.
-        llm_settings.enable_prompt_caching = True
-    llm = AWSBedrockLLMService(
-        aws_region=region,
-        aws_access_key=frozen.access_key,
-        aws_secret_key=frozen.secret_key,
-        aws_session_token=frozen.token,
-        settings=llm_settings,
     )
 
     # Always create an aiohttp session; MiniMax uses it, Polly just ignores it.
@@ -2661,6 +2793,60 @@ async def _build_pipeline(
     return task
 
 
+# --- Azure voice engine composition root (U-103) ------------------------
+# The VOICE_ENGINE=cascade STT->LLM->TTS path wires here: load_config becomes
+# real startup validation (all §11 violations reported at once), the registry
+# resolves the explicit selection to the FC-2/3/4 triple (zero default / zero
+# fallback, R-C-002), and CascadeEngine runs phrase-level streaming (spec
+# §7.1). The api_key params are the CR-C1 Key Vault takeover point (no §11
+# credential placeholder exists yet). Until explicitly selected this path is
+# not on any existing call surface (R-P-001/004/009 behaviour unchanged).
+from config_contract import load_config  # noqa: E402
+from cascade_engine import CascadeEngine  # noqa: E402
+from providers.base import AudioFormat  # noqa: E402
+from providers.registry import ProviderKind, ProviderRegistry  # noqa: E402
+from providers.speech import azure_speech, minimax_tts  # noqa: E402
+from providers.llm import azure_openai  # noqa: E402
+
+
+def build_cascade_engine(
+    env=None,
+    *,
+    speech_api_key="",
+    llm_api_key="",
+    minimax_api_key="",
+    system_prompt="",
+    tools=(),
+    execute_tool=None,
+):
+    """Compose the cascade engine from the explicit §11 registry selection.
+
+    execute_tool is the tool-execution confirmation seam (FC-3's
+    validate_tool_request only validates, never executes); minimax's
+    voice_lookup is wired to voices_for per the U-101 seam note.
+    """
+    config = load_config(os.environ if env is None else env)
+    registry = ProviderRegistry()
+    azure_speech.register(registry, api_key=speech_api_key, tts_sample_rate=OUTPUT_SAMPLE_RATE)
+    minimax_tts.register(
+        registry,
+        api_key=minimax_api_key,
+        tts_sample_rate=OUTPUT_SAMPLE_RATE,
+        voice_lookup=lambda: voices_for("minimax"),
+    )
+    azure_openai.register(registry, api_key=llm_api_key)
+    stt, llm, tts = registry.create(ProviderKind.REALTIME, config)
+    return CascadeEngine(
+        stt=stt,
+        llm=llm,
+        tts=tts,
+        input_format=AudioFormat(sample_rate=INPUT_SAMPLE_RATE, encoding="pcm16", channels=1),
+        system_prompt=system_prompt,
+        tools=tools,
+        execute_tool=execute_tool,
+    )
+
+
 app = FastAPI()
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
 
@@ -2694,7 +2880,10 @@ _RUNTIME_FALLBACK = {
     },
 }
 RUNTIME_CONFIG = RuntimeConfig(
-    path=os.path.join(os.path.dirname(os.path.abspath(__file__)), "config", "runtime.json"),
+    # R-C-003 每副本重歸屬縫：部署可將路徑指向持久卷（U-401）；與
+    # MCP_CFG_PATH_OVERRIDE 對稱（此前该缝被硬编码路径短路）。
+    path=os.environ.get("RUNTIME_CFG_PATH_OVERRIDE")
+    or os.path.join(os.path.dirname(os.path.abspath(__file__)), "config", "runtime.json"),
     fallback=_RUNTIME_FALLBACK,
 )
 
@@ -2712,7 +2901,7 @@ MCP_CONFIG = McpConfig(
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "").strip()
 
 # --- User store + role-based auth dependencies --------------------------
-from botocore.exceptions import ClientError
+from storage.cosmos import ContainerConflict
 from user_store import UserStore, AuthUnavailable
 
 USER_STORE = UserStore()
@@ -2843,8 +3032,8 @@ async def auth_setup(payload: dict, response: Response) -> dict:
     never reset or overwrite an existing account. It is the only public WRITE
     endpoint, so the guard is doubled: the _needs_setup() pre-check plus the
     conditional write inside USER_STORE.create — under a concurrent race only
-    one create wins; the loser's DynamoDB ConditionalCheckFailedException is
-    mapped to 409 (never 500)."""
+    one create wins; the loser's create-conflict (storage seam
+    ContainerConflict) is mapped to 409 (never 500)."""
     if not await _needs_setup():
         raise HTTPException(status_code=409, detail="already initialized")
 
@@ -2866,13 +3055,11 @@ async def auth_setup(payload: dict, response: Response) -> dict:
         # collision. Any ValueError here means the table is no longer empty
         # (lost the race) → 409, never 500.
         raise HTTPException(status_code=409, detail="already initialized")
-    except ClientError as e:
+    except ContainerConflict as e:
         # Defense-in-depth: even if create's normalization is ever removed, a
-        # raw ConditionalCheckFailedException from the concurrent loser must
-        # still surface as 409, never 500.
-        if e.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
-            raise HTTPException(status_code=409, detail="already initialized")
-        raise
+        # raw create-conflict from the concurrent loser must still surface as
+        # 409, never 500.
+        raise HTTPException(status_code=409, detail="already initialized")
 
     token = _issue_jwt(user)
     _set_session_cookie(response, token)
@@ -3128,7 +3315,7 @@ def _admin_options_payload() -> dict:
         ],
         "engines": [{"id": k, "label": v} for k, v in ENGINES.items()],
         "providers": [{"id": k, "label": v} for k, v in TTS_PROVIDERS.items()],
-        "models": [{"id": k, "label": k, "bedrock_id": v} for k, v in MODELS.items()],
+        "models": [{"id": k, "label": LABELS[k], "bedrock_id": v} for k, v in MODELS.items()],
         "minimax_models": [{"id": k, "label": v} for k, v in MINIMAX_MODELS.items()],
         "demos": demo_opts,
         "scenarios": demo_opts,
@@ -3489,64 +3676,35 @@ _ADMIN_OUTCOME_VALUES = {
     "unknown",
 }
 
+# Cosmos query projections (§1.2): narrow SELECT lists so list/CSV/metrics
+# paths never pay for the turns/summary blobs. The repo builds
+# ``SELECT c.<col>, ...`` from these tuples. The admin list reuses
+# _ADMIN_LIST_FIELDS directly (identical set).
+_CSV_QUERY_COLUMNS = (
+    "call_id", "caller", "started_at", "duration_s", "outcome", "engine",
+    "scenario", "lang", "summary_status", "transfer_requested",
+    "transfer_topic", "turn_count",
+)
+# The 8 columns _aggregate_metrics reads (AC #2 — no summary blob).
+_METRIC_COLUMNS = (
+    "call_id", "started_at", "ended_at", "duration_s", "outcome",
+    "transfer_requested", "scenario", "engine",
+)
+# User cards flatten summary.intent ⇒ summary must be in the SELECT list.
+_USER_CARD_COLUMNS = (
+    "call_id", "caller", "started_at", "ended_at", "duration_s",
+    "turn_count", "summary_status", "summary",
+)
+
 # Hard cap for the streaming CSV export. Above this we set X-Truncated: 1
 # so the front-end can prompt the operator to refine filters.
 _ADMIN_CSV_MAX_ROWS = 5000
 
 
-def _admin_history_filter_clause(
-    *,
-    outcome: str | None,
-    engine: str | None,
-    scenario: str | None,
-    start_after: int | None,
-    start_before: int | None,
-    skip_started_at: bool = False,
-) -> tuple[str, dict, dict]:
-    """Build a DDB FilterExpression covering the admin-list query knobs.
-
-    Returns ``(filter_expr, expr_attr_names, expr_attr_values)``. Empty filter
-    is signalled by an empty string for ``filter_expr``. Most column names are
-    DDB-reserved or look-reserved so we always go through ExpressionAttributeNames
-    aliases.
-
-    ``skip_started_at=True`` is used by the GSI Query path where the time-range
-    is folded into the KeyConditionExpression instead of the FilterExpression.
-    """
-    clauses: list[str] = []
-    names: dict[str, str] = {}
-    values: dict[str, object] = {}
-
-    if outcome:
-        names["#oc"] = "outcome"
-        values[":oc"] = outcome
-        clauses.append("#oc = :oc")
-    if engine:
-        names["#en"] = "engine"
-        values[":en"] = engine
-        clauses.append("#en = :en")
-    if scenario:
-        names["#sc"] = "scenario"
-        values[":sc"] = scenario
-        clauses.append("#sc = :sc")
-    if not skip_started_at:
-        if start_after is not None:
-            names["#sa"] = "started_at"
-            values[":sa_after"] = int(start_after)
-            clauses.append("#sa >= :sa_after")
-        if start_before is not None:
-            names["#sa"] = "started_at"
-            values[":sa_before"] = int(start_before)
-            clauses.append("#sa <= :sa_before")
-
-    return (" AND ".join(clauses), names, values)
-
-
 def _project_admin_card(item: dict) -> dict:
-    """Strip a full DDB row to the columns surfaced by the admin list view."""
+    """Strip a full history row to the columns surfaced by the admin list view."""
     out = {k: item.get(k) for k in _ADMIN_LIST_FIELDS}
-    # transfer_requested is stored as a bool but DDB hands it back as Decimal in
-    # some old rows; normalize.
+    # legacy rows may carry transfer_requested as 0/1; normalize to bool.
     tr = out.get("transfer_requested")
     if isinstance(tr, (int, float)):
         out["transfer_requested"] = bool(tr)
@@ -3568,11 +3726,12 @@ async def admin_list_history(
 ) -> dict:
     """Admin call-history list with cursor pagination + filters.
 
-    - When ``caller`` is provided, queries the ``caller-started-index`` GSI.
-    - Otherwise scans the table and applies a FilterExpression covering the
-      remaining knobs.
-    - Heavy columns (``turns``, ``summary``) are stripped via ProjectionExpression
-      so the list payload is bounded even for chatty calls.
+    - When ``caller`` is provided, the query is single-partition (PK
+      /caller_id, §1.2 caller path).
+    - Otherwise cross-partition with residual filters (outcome / engine /
+      scenario / time range).
+    - Both paths share the CI-1 ordering ``started_at DESC, id ASC`` and a
+      keyset cursor; heavy columns (``turns``, ``summary``) are never read.
     """
     if limit <= 0 or limit > 200:
         limit = 50
@@ -3585,110 +3744,29 @@ async def admin_list_history(
     if HISTORY_DISABLED or _history is None:
         return {"items": [], "next_cursor": None}
 
-    start_key = _decode_cursor(cursor)
-    table = _history_table()
-
-    # Projection used by both the Scan and the Query path. We alias every
-    # column to dodge DDB reserved-word collisions (started_at, outcome, ...).
-    proj_aliases = {
-        "#cid": "call_id",
-        "#caller": "caller",
-        "#sa": "started_at",
-        "#ea": "ended_at",
-        "#dur": "duration_s",
-        "#oc": "outcome",
-        "#en": "engine",
-        "#sc": "scenario",
-        "#lang": "lang",
-        "#ss": "summary_status",
-        "#tr": "transfer_requested",
-        "#tc": "turn_count",
-    }
-    projection = (
-        "#cid, #caller, #sa, #ea, #dur, #oc, #en, #sc, #lang, #ss, #tr, #tc"
-    )
-
     try:
-        if caller:
-            # Caller path → Query the GSI. We can fold start_after/start_before
-            # into the KeyConditionExpression via the sort key (started_at).
-            key_cond = "caller = :c"
-            expr_values: dict[str, object] = {":c": caller}
-            names = dict(proj_aliases)
-            if start_after is not None and start_before is not None:
-                key_cond += " AND #sa BETWEEN :sa_after AND :sa_before"
-                expr_values[":sa_after"] = int(start_after)
-                expr_values[":sa_before"] = int(start_before)
-            elif start_after is not None:
-                key_cond += " AND #sa >= :sa_after"
-                expr_values[":sa_after"] = int(start_after)
-            elif start_before is not None:
-                key_cond += " AND #sa <= :sa_before"
-                expr_values[":sa_before"] = int(start_before)
-            # outcome / engine / scenario fold into a separate FilterExpression.
-            filter_expr, fnames, fvalues = _admin_history_filter_clause(
-                outcome=outcome,
-                engine=engine,
-                scenario=scenario_filter,
-                start_after=None,
-                start_before=None,
-                skip_started_at=True,
-            )
-            names.update(fnames)
-            expr_values.update(fvalues)
-            query_kwargs = {
-                "IndexName": "caller-started-index",
-                "KeyConditionExpression": key_cond,
-                "ExpressionAttributeNames": names,
-                "ExpressionAttributeValues": expr_values,
-                "ScanIndexForward": False,
-                "Limit": limit,
-                "ProjectionExpression": projection,
-            }
-            if filter_expr:
-                query_kwargs["FilterExpression"] = filter_expr
-            if start_key:
-                query_kwargs["ExclusiveStartKey"] = start_key
-            resp = await asyncio.to_thread(table.query, **query_kwargs)
-        else:
-            # Non-caller path → Scan with a FilterExpression that covers
-            # outcome/engine/scenario/start_after/start_before.
-            filter_expr, fnames, fvalues = _admin_history_filter_clause(
-                outcome=outcome,
-                engine=engine,
-                scenario=scenario_filter,
-                start_after=start_after,
-                start_before=start_before,
-            )
-            names = dict(proj_aliases)
-            names.update(fnames)
-            scan_kwargs: dict = {
-                "ExpressionAttributeNames": names,
-                "ProjectionExpression": projection,
-                "Limit": limit,
-            }
-            if filter_expr:
-                scan_kwargs["FilterExpression"] = filter_expr
-            if fvalues:
-                scan_kwargs["ExpressionAttributeValues"] = fvalues
-            if start_key:
-                scan_kwargs["ExclusiveStartKey"] = start_key
-            resp = await asyncio.to_thread(table.scan, **scan_kwargs)
+        rows, next_cursor = await asyncio.to_thread(
+            _history_repo().query_history_docs,
+            caller=caller,
+            outcome=outcome,
+            engine=engine,
+            scenario=scenario_filter,
+            start_after=start_after,
+            start_before=start_before,
+            columns=_ADMIN_LIST_FIELDS,
+            cursor=cursor,
+            limit=limit,
+        )
+    except ValueError:
+        # keyset cursor decode failure (bad base64 / bad payload shape)
+        raise HTTPException(status_code=400, detail="invalid cursor")
     except HTTPException:
         raise
     except Exception:
         logger.exception("admin history list failed")
         raise HTTPException(status_code=500, detail="history backend unavailable")
 
-    items_raw = resp.get("Items") or []
-    items = [_decimal_to_native(_project_admin_card(it)) for it in items_raw]
-    # GSI Query already returns ScanIndexForward=False (newest first). Scan
-    # is unordered, so sort the page in-memory by started_at desc — the only
-    # column users sort by from the UI.
-    if not caller:
-        items.sort(key=lambda r: r.get("started_at") or 0, reverse=True)
-    last_key = resp.get("LastEvaluatedKey")
-    next_cursor = _encode_cursor(last_key) if last_key else None
+    items = [_project_admin_card(it) for it in rows]
     return {"items": items, "next_cursor": next_cursor}
 
 
@@ -3698,17 +3776,15 @@ async def admin_get_history_item(call_id: str, _: dict = Depends(require_admin))
     if HISTORY_DISABLED or _history is None:
         raise HTTPException(status_code=404, detail="not found")
     try:
-        table = _history_table()
-        resp = await asyncio.to_thread(table.get_item, Key={"call_id": call_id})
+        item = await asyncio.to_thread(_history_repo().get_history_doc, call_id)
     except HTTPException:
         raise
     except Exception:
         logger.exception("admin history get_item failed")
         raise HTTPException(status_code=500, detail="history backend unavailable")
-    item = resp.get("Item")
     if not item:
         raise HTTPException(status_code=404, detail="not found")
-    return _decimal_to_native(item)
+    return item
 
 
 def _format_summary_for_md(summary, status: str | None) -> str:
@@ -3771,17 +3847,14 @@ async def admin_export_history_md(call_id: str, _: dict = Depends(require_admin)
     if HISTORY_DISABLED or _history is None:
         raise HTTPException(status_code=404, detail="not found")
     try:
-        table = _history_table()
-        resp = await asyncio.to_thread(table.get_item, Key={"call_id": call_id})
+        item = await asyncio.to_thread(_history_repo().get_history_doc, call_id)
     except HTTPException:
         raise
     except Exception:
         logger.exception("admin history export.md get_item failed")
         raise HTTPException(status_code=500, detail="history backend unavailable")
-    raw = resp.get("Item")
-    if not raw:
+    if not item:
         raise HTTPException(status_code=404, detail="not found")
-    item = _decimal_to_native(raw)
 
     started_iso = _format_iso_utc(item.get("started_at"))
     duration_s = item.get("duration_s") or 0
@@ -3834,98 +3907,23 @@ def _scan_history_for_csv(
     start_after: int | None,
     start_before: int | None,
 ):
-    """Synchronous generator yielding raw DDB items page by page.
+    """Synchronous generator yielding raw history rows page by page.
 
-    The CSV endpoint runs this in a thread via ``asyncio.to_thread`` so the
-    event loop isn't blocked by DDB scan latency. It pages through
-    ``LastEvaluatedKey`` until the table is drained or the caller stops
-    iterating (the truncation guard relies on cooperative early-exit).
+    Thin wrapper over the repo's keyset iterator (§1.2 global/CSV path =
+    cross-partition residual filters, caller → single-partition). The CSV
+    endpoint runs this in a thread via ``asyncio.to_thread`` so the event
+    loop isn't blocked; the truncation guard relies on cooperative
+    early-exit (generator stops paging when the consumer breaks).
     """
-    table = _history_table()
-    proj_aliases = {
-        "#cid": "call_id",
-        "#caller": "caller",
-        "#sa": "started_at",
-        "#ea": "ended_at",
-        "#dur": "duration_s",
-        "#oc": "outcome",
-        "#en": "engine",
-        "#sc": "scenario",
-        "#lang": "lang",
-        "#ss": "summary_status",
-        "#tr": "transfer_requested",
-        "#tt": "transfer_topic",
-        "#tc": "turn_count",
-    }
-    projection = (
-        "#cid, #caller, #sa, #ea, #dur, #oc, #en, #sc, #lang, "
-        "#ss, #tr, #tt, #tc"
+    return _history_repo().iter_history_docs(
+        caller=caller,
+        outcome=outcome,
+        engine=engine,
+        scenario=scenario_filter,
+        start_after=start_after,
+        start_before=start_before,
+        columns=_CSV_QUERY_COLUMNS,
     )
-    last_key: dict | None = None
-    while True:
-        if caller:
-            key_cond = "caller = :c"
-            expr_values: dict[str, object] = {":c": caller}
-            names = dict(proj_aliases)
-            if start_after is not None and start_before is not None:
-                key_cond += " AND #sa BETWEEN :sa_after AND :sa_before"
-                expr_values[":sa_after"] = int(start_after)
-                expr_values[":sa_before"] = int(start_before)
-            elif start_after is not None:
-                key_cond += " AND #sa >= :sa_after"
-                expr_values[":sa_after"] = int(start_after)
-            elif start_before is not None:
-                key_cond += " AND #sa <= :sa_before"
-                expr_values[":sa_before"] = int(start_before)
-            filter_expr, fnames, fvalues = _admin_history_filter_clause(
-                outcome=outcome,
-                engine=engine,
-                scenario=scenario_filter,
-                start_after=None,
-                start_before=None,
-                skip_started_at=True,
-            )
-            names.update(fnames)
-            expr_values.update(fvalues)
-            kwargs = {
-                "IndexName": "caller-started-index",
-                "KeyConditionExpression": key_cond,
-                "ExpressionAttributeNames": names,
-                "ExpressionAttributeValues": expr_values,
-                "ScanIndexForward": False,
-                "ProjectionExpression": projection,
-            }
-            if filter_expr:
-                kwargs["FilterExpression"] = filter_expr
-            if last_key:
-                kwargs["ExclusiveStartKey"] = last_key
-            resp = table.query(**kwargs)
-        else:
-            filter_expr, fnames, fvalues = _admin_history_filter_clause(
-                outcome=outcome,
-                engine=engine,
-                scenario=scenario_filter,
-                start_after=start_after,
-                start_before=start_before,
-            )
-            names = dict(proj_aliases)
-            names.update(fnames)
-            kwargs = {
-                "ExpressionAttributeNames": names,
-                "ProjectionExpression": projection,
-            }
-            if filter_expr:
-                kwargs["FilterExpression"] = filter_expr
-            if fvalues:
-                kwargs["ExpressionAttributeValues"] = fvalues
-            if last_key:
-                kwargs["ExclusiveStartKey"] = last_key
-            resp = table.scan(**kwargs)
-        for it in resp.get("Items") or []:
-            yield it
-        last_key = resp.get("LastEvaluatedKey")
-        if not last_key:
-            break
 
 
 _ADMIN_CSV_COLUMNS = (
@@ -3945,21 +3943,20 @@ _ADMIN_CSV_COLUMNS = (
 
 
 def _row_to_csv_dict(item: dict) -> dict:
-    """Coerce a (possibly Decimal-laced) DDB row into the flat CSV column set."""
-    native = _decimal_to_native(item)
+    """Flatten a history row into the flat CSV column set."""
     return {
-        "call_id": native.get("call_id") or "",
-        "caller": native.get("caller") or "",
-        "started_utc": _format_iso_utc(native.get("started_at")),
-        "duration_s": native.get("duration_s") or 0,
-        "outcome": native.get("outcome") or "",
-        "engine": native.get("engine") or "",
-        "scenario": native.get("scenario") or "",
-        "lang": native.get("lang") or "",
-        "summary_status": native.get("summary_status") or "",
-        "transfer_requested": "true" if native.get("transfer_requested") else "false",
-        "transfer_topic": native.get("transfer_topic") or "",
-        "turn_count": native.get("turn_count") or 0,
+        "call_id": item.get("call_id") or "",
+        "caller": item.get("caller") or "",
+        "started_utc": _format_iso_utc(item.get("started_at")),
+        "duration_s": item.get("duration_s") or 0,
+        "outcome": item.get("outcome") or "",
+        "engine": item.get("engine") or "",
+        "scenario": item.get("scenario") or "",
+        "lang": item.get("lang") or "",
+        "summary_status": item.get("summary_status") or "",
+        "transfer_requested": "true" if item.get("transfer_requested") else "false",
+        "transfer_topic": item.get("transfer_topic") or "",
+        "turn_count": item.get("turn_count") or 0,
     }
 
 
@@ -4059,78 +4056,69 @@ async def admin_export_history_csv(
 
 @app.post("/api/admin/history/{call_id}/summarize")
 async def admin_resummarize_history(call_id: str, _: dict = Depends(require_admin)):
-    """Re-run the Bedrock summarizer over an existing call's transcript.
+    """Re-run the call summarizer over an existing call's transcript.
 
-    Re-uses the module-level :func:`_invoke_summary_bedrock` so we don't
-    drift from how end-of-call summarization is done. On success, persists
-    ``summary`` + ``summary_status='ok'`` and clears ``summary_error``. On
-    failure, persists ``summary_status='failed'`` + ``summary_error`` and
-    returns a 500 with ``{"error": "..."}`` so the SPA can render a toast.
+    C-9（已裁決 2026-11-09）：受理即回 ``200 {call_id, summary_status:"pending"}``
+    （``summary`` 省略）——行翻 pending，摘要 job 投 postcall-jobs 隊列異步執行
+    （§2.2 同隊列同冪等），終態 ok/failed 由 worker 落。入隊/持久化失敗仍
+    ``500 {"error"}``（error-as-data 寫 failed，防行永卡 pending）。未配置
+    Service Bus 時走 in-process 降級：同一受理契約，終態由本進程異步落。
     """
     from fastapi.responses import JSONResponse as _JR
 
     if HISTORY_DISABLED or _history is None:
         raise HTTPException(status_code=404, detail="not found")
     try:
-        table = _history_table()
-        resp = await asyncio.to_thread(table.get_item, Key={"call_id": call_id})
+        item = await asyncio.to_thread(_history_repo().get_history_doc, call_id)
     except HTTPException:
         raise
     except Exception:
         logger.exception("admin summarize get_item failed")
         raise HTTPException(status_code=500, detail="history backend unavailable")
-    raw = resp.get("Item")
-    if not raw:
+    if not item:
         raise HTTPException(status_code=404, detail="not found")
-    item = _decimal_to_native(raw)
-    turns = item.get("turns") or []
-    lang = item.get("lang") or DEFAULT_LANG
 
-    try:
-        struct = await _invoke_summary_bedrock(turns, lang)
-    except Exception as e:
-        logger.exception("admin summarize Bedrock invocation failed")
-        # Persist the failure shape so the row reflects reality.
-        try:
-            await asyncio.to_thread(
-                table.update_item,
-                Key={"call_id": call_id},
-                UpdateExpression="SET summary_status = :f, summary_error = :e",
-                ExpressionAttributeValues={
-                    ":f": "failed",
-                    ":e": str(e)[:500],
-                },
-            )
-        except Exception:
-            logger.exception("admin summarize failure persist failed")
-        return _JR(status_code=500, content={"error": f"{type(e).__name__}: {e}"})
-
-    # Success — persist + clear summary_error so we don't leave stale failure
-    # bread-crumbs from a previous attempt.
+    # 受理：行翻 pending（wire enum {pending, ok, failed}，終態歸 worker）。
     try:
         await asyncio.to_thread(
-            table.update_item,
-            Key={"call_id": call_id},
-            UpdateExpression=(
-                "SET summary = :s, summary_status = :ok REMOVE summary_error"
-            ),
-            ExpressionAttributeValues={
-                ":s": _to_ddb(struct),
-                ":ok": "ok",
-            },
+            _history_repo().patch_fields, call_id, {"summary_status": "pending"}
         )
     except Exception as e:
-        logger.exception("admin summarize update_item failed")
+        logger.exception("admin summarize persist failed")
         return _JR(
             status_code=500,
             content={"error": f"persist failed: {type(e).__name__}: {e}"},
         )
 
-    return {
-        "call_id": call_id,
-        "summary": struct,
-        "summary_status": "ok",
-    }
+    sink = _servicebus_sink()
+    try:
+        if sink is not None:
+            sink(_summary_job(call_id))
+        else:
+            # 降級腿複用 HistoryRecorder 的終態落庫路徑（_history 已在上文 404 守衛非 None）
+            asyncio.create_task(
+                _history._summarize_and_update(
+                    call_id, item.get("turns") or [],
+                    {"lang": item.get("lang") or ""},
+                )
+            )
+    except Exception as e:
+        logger.exception("admin summarize enqueue failed")
+        # 入隊失敗：error-as-data 寫 failed 後 500（行不永卡 pending）。
+        try:
+            await asyncio.to_thread(
+                _history_repo().patch_fields,
+                call_id,
+                {"summary_status": "failed", "summary_error": f"enqueue failed: {e}"[:500]},
+            )
+        except Exception:
+            logger.exception("admin summarize failure persist failed")
+        return _JR(
+            status_code=500,
+            content={"error": f"enqueue failed: {type(e).__name__}: {e}"},
+        )
+
+    return {"call_id": call_id, "summary_status": "pending"}
 
 
 # --- Tool registry helpers (T6) -----------------------------------------
@@ -5498,7 +5486,7 @@ async def config(_: dict = Depends(require_user)) -> dict:
             {"id": k, "label": v["label"], "engines": list(v.get("engines", []))}
             for k, v in LANGUAGES.items()
         ],
-        "models": [{"id": k, "label": k, "bedrock_id": v} for k, v in MODELS.items()],
+        "models": [{"id": k, "label": LABELS[k], "bedrock_id": v} for k, v in MODELS.items()],
         "providers": [{"id": k, "label": v} for k, v in TTS_PROVIDERS.items()],
         "minimax_models": [{"id": k, "label": v} for k, v in MINIMAX_MODELS.items()],
         "default_minimax_model": web.get("minimax_model", DEFAULT_MINIMAX_MODEL),
@@ -5621,6 +5609,7 @@ def _humanize_summary_struct(struct: dict, lang_key: str) -> str:
     return "\n".join(lines)
 
 
+# legacy 命名注记：行为已 Azure FC-3，函数名保留冻结（2026-11-10 裁定「名不动值重指」）
 async def _invoke_summary_bedrock(
     turns: list[dict],
     lang_key: str,
@@ -5628,10 +5617,10 @@ async def _invoke_summary_bedrock(
     model_key: str = DEFAULT_MODEL,
     system_override: str | None = None,
 ) -> dict:
-    """Run a Bedrock Converse summarization and return the canonical
+    """Run a one-shot LLM summarization (FC-3 complete) and return the canonical
     summary dict (intent / key_questions / action_items / sentiment / model /
     generated_at). Always returns a dict — never raises for parse errors.
-    Underlying Bedrock errors do propagate so callers can decide how to
+    Underlying LLM errors do propagate so callers can decide how to
     surface them (the recorder writes summary_status=failed)."""
     transcript = "\n".join(
         f"{'用戶/User' if t.get('who') == 'user' else '助手/Assistant'}: {t.get('text', '')}"
@@ -5654,25 +5643,15 @@ async def _invoke_summary_bedrock(
     system_instruction = base_prompt + _SUMMARY_JSON_INSTRUCTION
     model_id = MODELS.get(model_key) or MODELS[DEFAULT_MODEL]
 
-    region = os.environ.get("AWS_REGION", "us-east-1")
-    frozen = boto3.Session(region_name=region).get_credentials().get_frozen_credentials()
-    summary_settings = AWSBedrockLLMService.Settings(
-        model=model_id,
-        system_instruction=system_instruction,
+    # A-4：FC-3 one-shot（complete=stream 收集）；max_tokens=512 為 F6 總結原值
+    llm = make_managed_llm(model=model_id)
+    text = await llm.complete(
+        messages=[
+            ChatMessage(role="system", content=system_instruction),
+            ChatMessage(role="user", content=transcript),
+        ],
         max_tokens=512,
     )
-    if _is_claude_model_id(model_id):
-        summary_settings.enable_prompt_caching = True
-    llm = AWSBedrockLLMService(
-        aws_region=region,
-        aws_access_key=frozen.access_key,
-        aws_secret_key=frozen.secret_key,
-        aws_session_token=frozen.token,
-        settings=summary_settings,
-    )
-    ctx = LLMContext()
-    ctx.add_message({"role": "user", "content": transcript})
-    text = await llm.run_inference(ctx)
     struct = _coerce_summary_struct(text or "")
     struct["model"] = model_id
     struct["generated_at"] = int(time.time())
@@ -5738,6 +5717,7 @@ def _coerce_translate_struct(raw_text: str, expected_fields: list[str]) -> dict:
     return out
 
 
+# legacy 命名注记：行为已 Azure FC-3，函数名保留冻结（2026-11-10 裁定「名不动值重指」）
 async def _invoke_translate_bedrock(
     texts: dict[str, str],
     target_lang: str,
@@ -5746,11 +5726,11 @@ async def _invoke_translate_bedrock(
     model_key: str | None = None,
 ) -> dict:
     """Translate a ``{field: source_text}`` map into ``target_lang`` via a
-    one-shot Bedrock Converse call. Mirrors :func:`_invoke_summary_bedrock`
-    (same Settings / LLMContext / run_inference shape, InstanceRole creds).
+    one-shot LLM call (FC-3 complete). Mirrors :func:`_invoke_summary_bedrock`
+    (same one-shot shape, Managed Identity creds).
 
     Returns ``{field: translated_text}`` on success, or ``{"_error": ...}`` on
-    a parse failure (never raises for parse problems). Underlying Bedrock
+    a parse failure (never raises for parse problems). Underlying LLM
     errors propagate so the caller can surface them."""
     source_label = (LANGUAGES.get(source_lang) or {}).get("label", source_lang)
     target_label = (LANGUAGES.get(target_lang) or {}).get("label", target_lang)
@@ -5763,27 +5743,18 @@ async def _invoke_translate_bedrock(
     effective_key = model_key or TRANSLATE_MODEL
     model_id = MODELS.get(effective_key) or MODELS.get(TRANSLATE_MODEL) or MODELS[DEFAULT_MODEL]
 
-    region = os.environ.get("AWS_REGION", "us-east-1")
-    frozen = boto3.Session(region_name=region).get_credentials().get_frozen_credentials()
-    translate_settings = AWSBedrockLLMService.Settings(
-        model=model_id,
-        system_instruction=system_instruction,
-        max_tokens=4096,
-    )
-    if _is_claude_model_id(model_id):
-        translate_settings.enable_prompt_caching = True
-    llm = AWSBedrockLLMService(
-        aws_region=region,
-        aws_access_key=frozen.access_key,
-        aws_secret_key=frozen.secret_key,
-        aws_session_token=frozen.token,
-        settings=translate_settings,
-    )
-    ctx = LLMContext()
+    # A-5 硬約束：翻譯部署 max output 必須 ≥4096（CR-C2 live smoke 核部署上限）。
+    # max_tokens=4096 為 F6 翻譯原值。
+    llm = make_managed_llm(model=model_id)
     # Hand the model a JSON object of the source fields so it can echo back the
     # same keys with translated values.
-    ctx.add_message({"role": "user", "content": json.dumps(texts, ensure_ascii=False)})
-    text = await llm.run_inference(ctx)
+    text = await llm.complete(
+        messages=[
+            ChatMessage(role="system", content=system_instruction),
+            ChatMessage(role="user", content=json.dumps(texts, ensure_ascii=False)),
+        ],
+        max_tokens=4096,
+    )
     return _coerce_translate_struct(text or "", list(texts.keys()))
 
 
@@ -6503,48 +6474,13 @@ async def list_calls(_: dict = Depends(require_admin)) -> dict:
     return {"calls": snapshot}
 
 
-# --- Call history HTTP API (DynamoDB-backed) -----------------------------
+# --- Call history HTTP API (Cosmos-backed) ------------------------------
 # These endpoints expose the rows that HistoryRecorder writes after each
 # phone call. HISTORY_DISABLED ⇒ they short-circuit to empty results without
-# constructing any boto3 client.
-#
-# Pagination encoding: cursor is base64(JSON(LastEvaluatedKey)). The Python
-# bytes/Decimal values that DDB returns aren't JSON-serializable as-is, so
-# we coerce Decimal→int/float and drop binary types before encoding.
-import base64 as _b64
-from decimal import Decimal as _Decimal
-
-
-def _decimal_to_native(obj):
-    """Recursively walk DDB output and turn Decimal into int / float so the
-    payload is plain-JSON serializable."""
-    if isinstance(obj, _Decimal):
-        # ints round-trip exactly, floats may lose precision (acceptable for
-        # ttl/turn_count style fields used here).
-        return int(obj) if obj == obj.to_integral_value() else float(obj)
-    if isinstance(obj, list):
-        return [_decimal_to_native(v) for v in obj]
-    if isinstance(obj, dict):
-        return {k: _decimal_to_native(v) for k, v in obj.items()}
-    return obj
-
-
-def _encode_cursor(last_key: dict | None) -> str | None:
-    if not last_key:
-        return None
-    payload = json.dumps(_decimal_to_native(last_key), ensure_ascii=False)
-    return _b64.urlsafe_b64encode(payload.encode("utf-8")).decode("ascii")
-
-
-def _decode_cursor(cursor: str | None) -> dict | None:
-    if not cursor:
-        return None
-    try:
-        payload = _b64.urlsafe_b64decode(cursor.encode("ascii")).decode("utf-8")
-        return json.loads(payload)
-    except Exception as e:
-        logger.warning(f"invalid history cursor: {e}")
-        raise HTTPException(status_code=400, detail="invalid cursor")
+# touching the repo. 查路徑統一走 CosmosCallRepository：§1.2 CI-1 ORDER BY
+# started_at DESC, id ASC + keyset 游標（編解碼在 repo 側，壞游標 ValueError
+# → 400）。列投影固定 _USER_CARD_COLUMNS / _CSV_QUERY_COLUMNS /
+# _METRIC_COLUMNS，重列（turns/summary 正文）不入列表路徑。
 
 
 _LIST_FIELDS = (
@@ -6554,7 +6490,7 @@ _LIST_FIELDS = (
 
 
 def _project_card(item: dict) -> dict:
-    """Project a full DDB row down to the list-card shape."""
+    """Project a full history row down to the list-card shape."""
     out = {k: item.get(k) for k in _LIST_FIELDS}
     summary = item.get("summary") or {}
     if isinstance(summary, dict) and summary.get("intent"):
@@ -6562,11 +6498,11 @@ def _project_card(item: dict) -> dict:
     return out
 
 
-def _history_table():
-    """Return the DDB Table object for history. Caller must have already
-    verified `_history is not None` to avoid creating boto3 clients in the
+def _history_repo():
+    """Return the CosmosCallRepository for history. Caller must have already
+    verified `_history is not None` to avoid touching storage in the
     disabled path."""
-    return _history._table  # type: ignore[union-attr]
+    return _history._repo  # type: ignore[union-attr]
 
 
 @app.get("/api/history")
@@ -6580,60 +6516,30 @@ async def list_history(
     Scoped to ``web_user == <logged-in username>`` so a regular user only ever
     sees their own history. (Admins use /api/admin/history for the full view.)
 
-    Implementation note: the table has no partition that lets DynamoDB sort
-    rows by started_at globally — call_id is the hash key. So we Scan a few
-    pages, sort in-memory, and slice. This is fine while the table is small
-    (< ~10k rows). Once the table grows, swap this for a GSI on a constant
-    hash + started_at range.
+    web_user 不是分區鍵（PK 是 /caller_id），故本路徑=跨分區查詢+殘餘過濾
+    （§1.2 同類）；順序契約 CI-1（started_at DESC, id ASC）+ keyset 游標，
+    不再 Scan+內存排序。
     """
     if limit <= 0 or limit > 200:
         limit = 50
     if HISTORY_DISABLED or _history is None:
         return {"items": [], "next_cursor": None}
 
-    username = user["username"]
-    start_key = _decode_cursor(cursor)
-    page_limit = min(max(limit * 4, 50), 200)
-    target = limit * 4
-    aggregated: list[dict] = []
-    last_key: dict | None = start_key
-    pages = 0
     try:
-        table = _history_table()
-        while True:
-            kwargs = {
-                "Limit": page_limit,
-                "FilterExpression": "web_user = :u",
-                "ExpressionAttributeValues": {":u": username},
-            }
-            if last_key:
-                kwargs["ExclusiveStartKey"] = last_key
-            resp = await asyncio.to_thread(table.scan, **kwargs)
-            aggregated.extend(resp.get("Items", []))
-            last_key = resp.get("LastEvaluatedKey")
-            pages += 1
-            # Stop once we have at least 3 pages OR enough items, OR the
-            # table is fully scanned. Bound at 5 pages so a malicious key
-            # can't drive us into an unbounded loop.
-            if last_key is None:
-                break
-            if pages >= 3 and len(aggregated) >= target:
-                break
-            if pages >= 5:
-                break
+        rows, next_cursor = await asyncio.to_thread(
+            _history_repo().query_history_docs,
+            web_user=user["username"],
+            columns=_USER_CARD_COLUMNS,
+            cursor=cursor,
+            limit=limit,
+        )
+    except ValueError:
+        raise HTTPException(status_code=400, detail="invalid cursor")
     except Exception:
-        logger.exception("history scan failed")
+        logger.exception("history list failed")
         raise HTTPException(status_code=500, detail="history backend unavailable")
 
-    aggregated.sort(key=lambda x: int(x.get("started_at") or 0), reverse=True)
-    page = aggregated[:limit]
-    items = [_decimal_to_native(_project_card(it)) for it in page]
-    # If we cut the result short, encode the next ExclusiveStartKey so the
-    # caller can continue from the last DDB scan position. Note: this is a
-    # cursor over Scan order, NOT over our in-memory sorted view — clients
-    # may see slight reorderings around page boundaries, which is acceptable
-    # for a low-QPS history list.
-    next_cursor = _encode_cursor(last_key) if last_key else None
+    items = [_project_card(it) for it in rows]
     return {"items": items, "next_cursor": next_cursor}
 
 
@@ -6644,9 +6550,10 @@ async def list_history_by_caller(
     cursor: str | None = None,
     _: dict = Depends(require_admin),
 ) -> dict:
-    """List a single caller's calls, newest first, via the
-    `caller-started-index` GSI. The GSI is KEYS_ONLY so we follow the Query
-    with a BatchGetItem to fetch the projected fields from the main table.
+    """List a single caller's calls, newest first.
+
+    PK /caller_id（§1.1/§1.2）：caller 路徑=單分區查詢，順序 CI-1 + keyset
+    游標。舊 GSI+BatchGetItem 兩跳消失。
     """
     if limit <= 0 or limit > 200:
         limit = 50
@@ -6655,52 +6562,21 @@ async def list_history_by_caller(
     if HISTORY_DISABLED or _history is None:
         return {"items": [], "next_cursor": None}
 
-    start_key = _decode_cursor(cursor)
     try:
-        table = _history_table()
-        query_kwargs = {
-            "IndexName": "caller-started-index",
-            "KeyConditionExpression": "caller = :c",
-            "ExpressionAttributeValues": {":c": caller},
-            "ScanIndexForward": False,
-            "Limit": limit,
-        }
-        if start_key:
-            query_kwargs["ExclusiveStartKey"] = start_key
-        resp = await asyncio.to_thread(table.query, **query_kwargs)
-        keys = [{"call_id": it["call_id"]} for it in resp.get("Items", [])]
-        next_cursor = _encode_cursor(resp.get("LastEvaluatedKey"))
-
-        if not keys:
-            return {"items": [], "next_cursor": next_cursor}
-
-        # BatchGetItem returns up to 100 items per request — limit ≤ 200 so
-        # in the worst case we make two batches.
-        ddb = boto3.resource("dynamodb", region_name=os.environ.get("DDB_REGION") or os.environ.get("AWS_REGION", "us-east-1"))
-
-        def _batch_get(batch_keys: list[dict]) -> list[dict]:
-            req = {table.name: {"Keys": batch_keys}}
-            out: list[dict] = []
-            while req:
-                bresp = ddb.batch_get_item(RequestItems=req)
-                out.extend(bresp.get("Responses", {}).get(table.name, []))
-                req = bresp.get("UnprocessedKeys") or None
-            return out
-
-        items: list[dict] = []
-        for i in range(0, len(keys), 100):
-            chunk = keys[i : i + 100]
-            items.extend(await asyncio.to_thread(_batch_get, chunk))
-    except HTTPException:
-        raise
+        rows, next_cursor = await asyncio.to_thread(
+            _history_repo().query_history_docs,
+            caller=caller,
+            columns=_USER_CARD_COLUMNS,
+            cursor=cursor,
+            limit=limit,
+        )
+    except ValueError:
+        raise HTTPException(status_code=400, detail="invalid cursor")
     except Exception:
         logger.exception("history by-caller failed")
         raise HTTPException(status_code=500, detail="history backend unavailable")
 
-    # BatchGetItem does NOT preserve key order — re-sort by started_at desc
-    # so the response matches the GSI's order.
-    items.sort(key=lambda x: int(x.get("started_at") or 0), reverse=True)
-    cards = [_decimal_to_native(_project_card(it)) for it in items]
+    cards = [_project_card(it) for it in rows]
     return {"items": cards, "next_cursor": next_cursor}
 
 
@@ -6712,21 +6588,21 @@ async def get_history_item(
     """Return a full call row including transcript turns + summary.
 
     A non-admin may only fetch rows attributed to them (``web_user`` ==
-    their username); anything else 404s so call ids can't be enumerated."""
+    their username); anything else 404s so call ids can't be enumerated.
+    turns 由 repo 從 transcripts/call_events 重拼（X1 折疊），外部形狀不變。
+    """
     if HISTORY_DISABLED or _history is None:
         raise HTTPException(status_code=404, detail="not found")
     try:
-        table = _history_table()
-        resp = await asyncio.to_thread(table.get_item, Key={"call_id": call_id})
+        item = await asyncio.to_thread(_history_repo().get_history_doc, call_id)
     except Exception:
         logger.exception("history get_item failed")
         raise HTTPException(status_code=500, detail="history backend unavailable")
-    item = resp.get("Item")
     if not item:
         raise HTTPException(status_code=404, detail="not found")
     if user.get("role") != "admin" and item.get("web_user") != user["username"]:
         raise HTTPException(status_code=404, detail="not found")
-    return _decimal_to_native(item)
+    return item
 
 
 # --- Admin metrics aggregation -------------------------------------------
@@ -6805,60 +6681,37 @@ def _utc_midnight(now_ts: float) -> int:
     return int(now_ts) - (int(now_ts) % 86400)
 
 
-async def _scan_recent_history(now_ts: float) -> list[dict]:
-    """Scan the history table for rows with ``started_at >= now-86400``.
+# 指標路徑行數上限：24h 視窗 ~k 行為工作集，超出即告警截斷
+# （p50/p95 尾部失真可接受，儀表板仍出值；詳見 §1.2 指標行解讀）。
+_METRICS_ROW_CAP = 10_000
 
-    Pages through ``LastEvaluatedKey`` so we don't miss rows in tables that
-    cross the 1 MB scan-page boundary. ProjectionExpression limits columns
-    so we never pay the read cost of turns/summary on the metrics path
-    (AC #2).
+
+async def _scan_recent_history(now_ts: float) -> list[dict]:
+    """Fetch rows with ``started_at >= now-86400`` for the metrics aggregator.
+
+    §1.2 指標路徑：窄列 keyset 遍歷（_METRIC_COLUMNS 8 列），絕不讀
+    turns/summary（AC #2）。行數上限截斷 + 告警，防止巨表拖死儀表板。
     """
     if HISTORY_DISABLED or _history is None:
         return []
     cutoff = int(now_ts) - 86400
-    table = _history_table()
-    items: list[dict] = []
-    last_key: dict | None = None
-    # `started_at`, `outcome`, `engine`, `scenario`, `duration_s`, `ended_at`
-    # are reserved or near-reserved in DynamoDB FilterExpression land, so we
-    # alias every column through ExpressionAttributeNames to be safe.
-    name_aliases = {
-        "#cid": "call_id",
-        "#sa": "started_at",
-        "#ea": "ended_at",
-        "#dur": "duration_s",
-        "#oc": "outcome",
-        "#tr": "transfer_requested",
-        "#sc": "scenario",
-        "#en": "engine",
-    }
-    scan_kwargs_base = {
-        "FilterExpression": "#sa >= :cutoff",
-        "ProjectionExpression": "#cid, #sa, #ea, #dur, #oc, #tr, #sc, #en",
-        "ExpressionAttributeNames": name_aliases,
-        "ExpressionAttributeValues": {":cutoff": cutoff},
-    }
-    pages = 0
-    while True:
-        kwargs = dict(scan_kwargs_base)
-        if last_key:
-            kwargs["ExclusiveStartKey"] = last_key
-        resp = await asyncio.to_thread(table.scan, **kwargs)
-        items.extend(resp.get("Items", []))
-        last_key = resp.get("LastEvaluatedKey")
-        pages += 1
-        if last_key is None:
-            break
-        # Hard cap so a giant table can't stall the dashboard. Real prod
-        # table size is ~k rows over 30d so this is comfortably above the
-        # working set; if we ever hit it the front-end still gets a value.
-        if pages >= 20:
-            logger.warning(
-                f"_scan_recent_history page cap hit (pages={pages}); "
-                f"truncating at {len(items)} rows"
-            )
-            break
-    return [_decimal_to_native(it) for it in items]
+
+    def _collect() -> list[dict]:
+        items: list[dict] = []
+        for row in _history_repo().iter_history_docs(
+            start_after=cutoff,
+            columns=_METRIC_COLUMNS,
+        ):
+            items.append(row)
+            if len(items) >= _METRICS_ROW_CAP:
+                logger.warning(
+                    f"_scan_recent_history row cap hit (cap={_METRICS_ROW_CAP}); "
+                    f"truncating at {len(items)} rows"
+                )
+                break
+        return items
+
+    return await asyncio.to_thread(_collect)
 
 
 def _aggregate_metrics(now_ts: float, rows: list[dict], active_calls: int) -> dict:

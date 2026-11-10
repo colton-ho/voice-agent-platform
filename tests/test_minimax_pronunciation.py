@@ -93,7 +93,7 @@ def _import_bot_clean() -> object:
     os.environ.setdefault("MINIMAX_API_KEY", "test-api-key")
     os.environ.setdefault("MINIMAX_GROUP_ID", "")
     os.environ.setdefault("ADMIN_PASSWORD", "")
-    os.environ.setdefault("HISTORY_TABLE", "")
+    os.environ.setdefault("HISTORY_DISABLED", "1")
     for mod in list(sys.modules):
         if mod in ("bot",):
             del sys.modules[mod]

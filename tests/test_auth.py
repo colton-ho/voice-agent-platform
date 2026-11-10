@@ -2,16 +2,17 @@
 
 Covers:
   - user_store: bcrypt hash roundtrip, CRUD, verify, disabled handling,
-    table-missing graceful degradation.
+    container-missing graceful degradation.
   - JWT helpers: _issue_jwt / _decode_jwt happy path + expiry + tamper.
   - require_user / require_admin via the live endpoints: 401 (no/invalid
     cookie), 403 (user role on an admin route).
   - /api/auth login / me / logout happy + failure paths (incl. disabled user).
-  - First-boot seed: empty table + ADMIN_PASSWORD -> bootstrap admin.
+  - First-boot seed: empty store + ADMIN_PASSWORD -> bootstrap admin.
   - /phone/ws carries NO require_user dependency (PSTN must never need login).
 
-All DynamoDB access is mocked with moto. bcrypt + PyJWT are real (installed in
-the venv). https base_url is used so the Secure vb_session cookie round-trips
+Storage is the in-memory Cosmos fake (tests/fake_cosmos.py) injected through
+the storage.cosmos provider seam. bcrypt + PyJWT are real (installed in the
+venv). https base_url is used so the Secure vb_session cookie round-trips
 through TestClient.
 """
 
@@ -19,40 +20,37 @@ from __future__ import annotations
 
 import asyncio
 import importlib
-import os
 import sys
-import time
 
-import boto3
 import pytest
-from moto import mock_aws
 
-USERS_TABLE = "voicebot-test-auth-users"
+from fake_cosmos import FakeCosmos
+from storage import cosmos
+from storage.cosmos import ContainerNotFound
+
+
 _ADMIN_PWD = "admin-secret"
-
-
-def _create_users_table(region: str = "us-east-1") -> None:
-    ddb = boto3.client("dynamodb", region_name=region)
-    ddb.create_table(
-        TableName=USERS_TABLE,
-        BillingMode="PAY_PER_REQUEST",
-        AttributeDefinitions=[{"AttributeName": "username", "AttributeType": "S"}],
-        KeySchema=[{"AttributeName": "username", "KeyType": "HASH"}],
-    )
-    ddb.get_waiter("table_exists").wait(TableName=USERS_TABLE)
 
 
 @pytest.fixture
 def auth_env(monkeypatch):
-    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
-    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "testing")
-    monkeypatch.setenv("AWS_DEFAULT_REGION", "us-east-1")
-    monkeypatch.setenv("AWS_REGION", "us-east-1")
     monkeypatch.setenv("MINIMAX_API_KEY", "x")
     monkeypatch.setenv("AUTH_SECRET", "unit-test-secret-key-32-bytes-long!!")
-    monkeypatch.setenv("USERS_TABLE", USERS_TABLE)
     monkeypatch.setenv("ADMIN_PASSWORD", _ADMIN_PWD)
     yield
+
+
+@pytest.fixture
+def fake():
+    f = FakeCosmos()
+    cosmos.set_container_provider(f)
+    yield f
+    cosmos.reset_container_provider()
+
+
+def _missing_provider(name):
+    """Simulates absent containers: every op raises ContainerNotFound."""
+    raise ContainerNotFound(name)
 
 
 def _fresh_user_store():
@@ -105,7 +103,7 @@ def test_bcrypt_roundtrip(auth_env):
     assert us.check_password("hunter2", "not-a-hash") is False
 
 
-def test_user_store_crud_and_verify(auth_env):
+def test_user_store_crud_and_verify(auth_env, fake):
     us = _fresh_user_store()
 
     async def run():
@@ -159,13 +157,11 @@ def test_user_store_crud_and_verify(auth_env):
         assert await store.get("alice") is None
         assert await store.delete("alice") is False
 
-    with mock_aws():
-        _create_users_table()
-        asyncio.run(run())
+    asyncio.run(run())
 
 
 def test_user_store_missing_table_degrades(auth_env):
-    """No table created -> reads degrade to empty rather than raising."""
+    """No container -> reads degrade to empty rather than raising."""
     us = _fresh_user_store()
 
     async def run():
@@ -174,9 +170,12 @@ def test_user_store_missing_table_degrades(auth_env):
         assert await store.get("anyone") is None
         assert await store.verify("anyone", "x") is None
 
-    with mock_aws():
-        # deliberately do NOT create the table
+    cosmos.set_container_provider(_missing_provider)
+    try:
+        # deliberately point at absent containers
         asyncio.run(run())
+    finally:
+        cosmos.reset_container_provider()
 
 
 # ---------------------------------------------------------------------------
@@ -212,144 +211,128 @@ def test_jwt_tampered_or_empty_returns_none(auth_env):
 # Auth API: login / me / logout
 # ---------------------------------------------------------------------------
 
-def test_login_me_logout_happy_path(auth_env):
-    with mock_aws():
-        _create_users_table()
-        bot = _import_bot()
-        client = _client(bot)  # seed + login as admin
+def test_login_me_logout_happy_path(auth_env, fake):
+    bot = _import_bot()
+    client = _client(bot)  # seed + login as admin
 
-        me = client.get("/api/auth/me")
-        assert me.status_code == 200
-        assert me.json() == {"username": "admin", "role": "admin"}
+    me = client.get("/api/auth/me")
+    assert me.status_code == 200
+    assert me.json() == {"username": "admin", "role": "admin"}
 
-        out = client.post("/api/auth/logout")
-        assert out.status_code == 200
-        # cookie cleared -> me now 401
-        assert client.get("/api/auth/me").status_code == 401
+    out = client.post("/api/auth/logout")
+    assert out.status_code == 200
+    # cookie cleared -> me now 401
+    assert client.get("/api/auth/me").status_code == 401
 
 
-def test_login_bad_credentials_401(auth_env):
-    with mock_aws():
-        _create_users_table()
-        bot = _import_bot()
-        client = _anon_client(bot)  # startup seeds admin
-        r = client.post("/api/auth/login", json={"username": "admin", "password": "wrong"})
-        assert r.status_code == 401
-        r = client.post("/api/auth/login", json={"username": "ghost", "password": "x"})
-        assert r.status_code == 401
-        r = client.post("/api/auth/login", json={"username": "", "password": ""})
-        assert r.status_code == 401
+def test_login_bad_credentials_401(auth_env, fake):
+    bot = _import_bot()
+    client = _anon_client(bot)  # startup seeds admin
+    r = client.post("/api/auth/login", json={"username": "admin", "password": "wrong"})
+    assert r.status_code == 401
+    r = client.post("/api/auth/login", json={"username": "ghost", "password": "x"})
+    assert r.status_code == 401
+    r = client.post("/api/auth/login", json={"username": "", "password": ""})
+    assert r.status_code == 401
 
 
-def test_disabled_user_cannot_login_or_authenticate(auth_env):
-    with mock_aws():
-        _create_users_table()
-        bot = _import_bot()
-        admin = _client(bot)
-        # create then disable a user
-        admin.post("/api/admin/users", json={"username": "eve", "password": "pw-eve", "role": "user"})
-        admin.patch("/api/admin/users/eve", json={"disabled": True})
+def test_disabled_user_cannot_login_or_authenticate(auth_env, fake):
+    bot = _import_bot()
+    admin = _client(bot)
+    # create then disable a user
+    admin.post("/api/admin/users", json={"username": "eve", "password": "pw-eve", "role": "user"})
+    admin.patch("/api/admin/users/eve", json={"disabled": True})
 
-        anon = _anon_client(bot)
-        r = anon.post("/api/auth/login", json={"username": "eve", "password": "pw-eve"})
-        assert r.status_code == 401
+    anon = _anon_client(bot)
+    r = anon.post("/api/auth/login", json={"username": "eve", "password": "pw-eve"})
+    assert r.status_code == 401
 
 
 # ---------------------------------------------------------------------------
 # require_user / require_admin
 # ---------------------------------------------------------------------------
 
-def test_require_user_401_without_cookie(auth_env):
-    with mock_aws():
-        _create_users_table()
-        bot = _import_bot()
-        anon = _anon_client(bot)
-        assert anon.get("/api/auth/me").status_code == 401
-        assert anon.get("/api/config").status_code == 401
-        assert anon.get("/api/ws-token").status_code == 401
+def test_require_user_401_without_cookie(auth_env, fake):
+    bot = _import_bot()
+    anon = _anon_client(bot)
+    assert anon.get("/api/auth/me").status_code == 401
+    assert anon.get("/api/config").status_code == 401
+    assert anon.get("/api/ws-token").status_code == 401
 
 
-def test_require_user_401_with_invalid_cookie(auth_env):
-    with mock_aws():
-        _create_users_table()
-        bot = _import_bot()
-        anon = _anon_client(bot)
-        anon.cookies.set("vb_session", "not-a-jwt")
-        assert anon.get("/api/auth/me").status_code == 401
+def test_require_user_401_with_invalid_cookie(auth_env, fake):
+    bot = _import_bot()
+    anon = _anon_client(bot)
+    anon.cookies.set("vb_session", "not-a-jwt")
+    assert anon.get("/api/auth/me").status_code == 401
 
 
-def test_require_admin_403_for_regular_user(auth_env):
-    with mock_aws():
-        _create_users_table()
-        bot = _import_bot()
-        admin = _client(bot)
-        admin.post("/api/admin/users", json={"username": "frank", "password": "pw-frank", "role": "user"})
+def test_require_admin_403_for_regular_user(auth_env, fake):
+    bot = _import_bot()
+    admin = _client(bot)
+    admin.post("/api/admin/users", json={"username": "frank", "password": "pw-frank", "role": "user"})
 
-        user_client = _anon_client(bot)
-        assert user_client.post(
-            "/api/auth/login", json={"username": "frank", "password": "pw-frank"}
-        ).status_code == 200
-        # admin route -> 403
-        assert user_client.get("/api/admin/users").status_code == 403
-        assert user_client.get("/api/admin/config").status_code == 403
-        # user-allowed route -> 200
-        assert user_client.get("/api/config").status_code == 200
-        assert user_client.get("/api/ws-token").status_code == 200
+    user_client = _anon_client(bot)
+    assert user_client.post(
+        "/api/auth/login", json={"username": "frank", "password": "pw-frank"}
+    ).status_code == 200
+    # admin route -> 403
+    assert user_client.get("/api/admin/users").status_code == 403
+    assert user_client.get("/api/admin/config").status_code == 403
+    # user-allowed route -> 200
+    assert user_client.get("/api/config").status_code == 200
+    assert user_client.get("/api/ws-token").status_code == 200
 
 
 # ---------------------------------------------------------------------------
 # User management API
 # ---------------------------------------------------------------------------
 
-def test_user_management_api(auth_env):
-    with mock_aws():
-        _create_users_table()
-        bot = _import_bot()
-        admin = _client(bot)
+def test_user_management_api(auth_env, fake):
+    bot = _import_bot()
+    admin = _client(bot)
 
-        # create
-        r = admin.post("/api/admin/users", json={"username": "grace", "password": "pw1", "role": "user"})
-        assert r.status_code == 200
-        assert r.json()["user"]["role"] == "user"
+    # create
+    r = admin.post("/api/admin/users", json={"username": "grace", "password": "pw1", "role": "user"})
+    assert r.status_code == 200
+    assert r.json()["user"]["role"] == "user"
 
-        # duplicate -> 400
-        assert admin.post("/api/admin/users", json={"username": "grace", "password": "pw1"}).status_code == 400
+    # duplicate -> 400
+    assert admin.post("/api/admin/users", json={"username": "grace", "password": "pw1"}).status_code == 400
 
-        # list includes both seeded admin + grace
-        names = {u["username"] for u in admin.get("/api/admin/users").json()["users"]}
-        assert {"admin", "grace"} <= names
+    # list includes both seeded admin + grace
+    names = {u["username"] for u in admin.get("/api/admin/users").json()["users"]}
+    assert {"admin", "grace"} <= names
 
-        # patch role + password + disabled
-        assert admin.patch("/api/admin/users/grace", json={"role": "admin"}).json()["user"]["role"] == "admin"
-        assert admin.patch("/api/admin/users/grace", json={"password": "pw2"}).status_code == 200
-        assert admin.patch("/api/admin/users/grace", json={"disabled": True}).json()["user"]["disabled"] is True
+    # patch role + password + disabled
+    assert admin.patch("/api/admin/users/grace", json={"role": "admin"}).json()["user"]["role"] == "admin"
+    assert admin.patch("/api/admin/users/grace", json={"password": "pw2"}).status_code == 200
+    assert admin.patch("/api/admin/users/grace", json={"disabled": True}).json()["user"]["disabled"] is True
 
-        # patch unknown user -> 404
-        assert admin.patch("/api/admin/users/ghost", json={"role": "user"}).status_code == 404
-        # empty patch -> 400
-        assert admin.patch("/api/admin/users/grace", json={}).status_code == 400
+    # patch unknown user -> 404
+    assert admin.patch("/api/admin/users/ghost", json={"role": "user"}).status_code == 404
+    # empty patch -> 400
+    assert admin.patch("/api/admin/users/grace", json={}).status_code == 400
 
-        # admin cannot delete self
-        assert admin.delete("/api/admin/users/admin").status_code == 400
-        # delete grace
-        assert admin.delete("/api/admin/users/grace").status_code == 200
-        assert admin.delete("/api/admin/users/grace").status_code == 404
+    # admin cannot delete self
+    assert admin.delete("/api/admin/users/admin").status_code == 400
+    # delete grace
+    assert admin.delete("/api/admin/users/grace").status_code == 200
+    assert admin.delete("/api/admin/users/grace").status_code == 404
 
 
 # ---------------------------------------------------------------------------
 # First-boot seed
 # ---------------------------------------------------------------------------
 
-def test_seed_admin_is_noop_even_with_admin_password(auth_env):
+def test_seed_admin_is_noop_even_with_admin_password(auth_env, fake):
     """The ADMIN_PASSWORD first-boot seed has been removed (see test_setup.py).
     _seed_admin() is now a no-op: even with ADMIN_PASSWORD set, calling it does
-    NOT create a user. The table stays empty."""
-    with mock_aws():
-        _create_users_table()
-        bot = _import_bot()
-        assert bot.ADMIN_PASSWORD  # auth_env sets ADMIN_PASSWORD
-        asyncio.run(bot._seed_admin())
-        assert asyncio.run(bot.USER_STORE.list()) == []
+    NOT create a user. The store stays empty."""
+    bot = _import_bot()
+    assert bot.ADMIN_PASSWORD  # auth_env sets ADMIN_PASSWORD
+    asyncio.run(bot._seed_admin())
+    assert asyncio.run(bot.USER_STORE.list()) == []
 
 
 # ---------------------------------------------------------------------------
@@ -377,19 +360,17 @@ def test_phone_ws_has_no_auth_dependency(auth_env):
     assert "require_admin" not in str(sig)
 
 
-def test_ws_endpoint_requires_user_bound_token(auth_env):
+def test_ws_endpoint_requires_user_bound_token(auth_env, fake):
     """/ws (web call) must reject a handshake with no/invalid token, but the
     PSTN /phone/ws must accept (no auth). We check via the WS test client."""
-    with mock_aws():
-        _create_users_table()
-        bot = _import_bot()
-        from fastapi.testclient import TestClient
-        from starlette.websockets import WebSocketDisconnect
+    bot = _import_bot()
+    from fastapi.testclient import TestClient
+    from starlette.websockets import WebSocketDisconnect
 
-        client = TestClient(bot.app, base_url="https://testserver")
-        client.__enter__()
-        # No token -> /ws closes with 1008.
-        with pytest.raises(WebSocketDisconnect) as exc:
-            with client.websocket_connect("/ws"):
-                pass
-        assert exc.value.code == 1008
+    client = TestClient(bot.app, base_url="https://testserver")
+    client.__enter__()
+    # No token -> /ws closes with 1008.
+    with pytest.raises(WebSocketDisconnect) as exc:
+        with client.websocket_connect("/ws"):
+            pass
+    assert exc.value.code == 1008

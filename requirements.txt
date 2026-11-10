@@ -1,0 +1,44 @@
+# U-001 declared dependencies — aligned with the deploy install line
+# (deploy/cloudformation.yaml:426-429) and the in-code runtime pin
+# (PINNED_PIPECAT, bot.py:6090). Exact resolved versions: requirements.lock.
+# 易错点：绝不可从 vendored ./pipecat 源码树安装（1.1.x 时代、仅参考；
+# 部署 tarball 同样排除它，见 deploy/deploy.sh:70）。
+
+# 运行时版本钉。四个 extras 均真实存在于 pipecat-ai 1.4.0（已核对安装 wheel 的
+# METADATA Provides-Extra）：aws→aiobotocore；aws-nova-sonic→aws_sdk_bedrock_runtime；
+# silero→空 extra（onnxruntime 在 1.4.0 已是基础依赖）；websocket→fastapi。
+pipecat-ai[aws,aws-nova-sonic,silero,websocket]==1.4.0
+
+# 应用运行时（与 CFN UserData 同集合同约束；覆盖 bot.py 导入链与 tests/ 运行）
+boto3
+# CR-C2（裁決 A-3 收窄面，#16）：只钉 azure-identity / openai SDK 两个版本——
+# LLM 側 MI（B5 行為變化，azure-identity token provider）+ FC-3 適配器驅動面。
+# pipecat-ai[azure] 不引（案 (i) 否決）；azure-cosmos/azure-servicebus 归 #17。
+azure-identity==1.27.0
+openai==2.54.0
+# #17 B-1/B-3（本环 requirements 第二次变化）：数据面 cosmos_calls + Service Bus worker。
+# 4.17.1 / 7.15.0 = 本环境解析到的最新稳定版，已装入 .venv 验证 import 纯度边界。
+azure-cosmos==4.17.1
+azure-servicebus==7.15.0
+# aioboto3 已移除 — CR-1：与 pipecat-ai==1.4.0 的 aiobotocore<4 约束不可共存，且无运行时引用（G-2），见 docs/azure/dependency-matrix.md
+aiohttp
+python-dotenv
+fastapi
+uvicorn
+ruamel.yaml>=0.18,<0.19
+PyYAML
+mcp==1.30.0
+# U-105（CR-3）：钉 pipecat-ai 1.4.0 的 mcp 互作版本——其 METADATA:115 声明 mcp[cli]<2,>=1.11.0。取声明区间内与本环境冻结
+# pydantic 2.14.3 兼容的 1.x：下界 1.11.0 的 fastmcp 私有 API（eval_type_backport）已被 pydantic 2.14 漂移证伪，
+# 1.30.0 声明 pydantic>=2.11 且 import-smoke 全绿（test_pinned_pipecat.py）。原 mcp>=1.0 解析到 2.3.0 违反 <2 上界（C5 根因）
+bcrypt>=4
+PyJWT>=2
+
+# 测试工具（tests/ 46 个既有文件 + tests/test_pinned_pipecat.py）
+pytest
+pytest-asyncio
+# CR-3：补上 async 测试运行器——旧 tests/ 大量 @pytest.mark.asyncio 用例（U-005 C1 缺口）
+moto>=5
+# moto 5 API：tests/ 统一 `from moto import mock_aws`
+httpx
+# tests/test_mcp_sigv4.py 模块级直接 import httpx

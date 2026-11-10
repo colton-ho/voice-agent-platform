@@ -1,39 +1,32 @@
-"""Tests for demo_store.DemoStore (T3) — DDB-backed demo store that preserves
+"""Tests for demo_store.DemoStore (T3) — Cosmos-backed demo store that preserves
 DemoLoader's interface.
 
 Coverage:
   - put -> rescan -> get/list reads back the SAME dict, including the
-    ``tool_ids`` key (NOT ``tools``), kb_chars summary, and a Decimal->float
+    ``tool_ids`` key (NOT ``tools``), kb_chars summary, and a number
     round-trip for filler.probability.
-  - rescan() scans the whole (paginated) table into the in-memory cache.
-  - Table-missing degrades: get()->None, list()->[], last_skipped recorded,
+  - rescan() reads the whole container into the in-memory cache.
+  - Container-missing degrades: get()->None, list()->[], last_skipped recorded,
     no raise.
   - The pure normalization helper (demo_loader.normalize_demo_dict) yields a
     dict whose tool list key is ``tool_ids``.
 
-DynamoDB is mocked with moto (mock_aws). If moto were unavailable, the
-table-missing degrade path and the pure-helper assertion still run standalone
-(they need no live table) — see the module-level skip guard.
+Storage is the in-memory Cosmos fake (tests/fake_cosmos.py) injected through
+the storage.cosmos provider seam; the missing-container degrade path runs with
+a provider that raises ContainerNotFound.
 """
 
 from __future__ import annotations
 
 import asyncio
-import os
 
-import boto3
 import pytest
-
-try:
-    from moto import mock_aws
-    _HAVE_MOTO = True
-except Exception:  # pragma: no cover — env without moto
-    _HAVE_MOTO = False
 
 from demo_loader import normalize_demo_dict
 from demo_store import DemoStore, _from_ddb
-
-DEMOS_TABLE = "voicebot-test-demos"
+from fake_cosmos import FakeCosmos
+from storage import cosmos
+from storage.cosmos import ContainerNotFound
 
 
 # A demo dict that exercises every key shape DemoLoader.get produces:
@@ -57,28 +50,20 @@ SAMPLE_DEMO = {
 
 
 @pytest.fixture
-def ddb_env(monkeypatch):
-    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
-    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "testing")
-    monkeypatch.setenv("AWS_DEFAULT_REGION", "us-east-1")
-    monkeypatch.setenv("AWS_REGION", "us-east-1")
-    monkeypatch.setenv("DEMOS_TABLE", DEMOS_TABLE)
-    yield
+def fake():
+    f = FakeCosmos()
+    cosmos.set_container_provider(f)
+    yield f
+    cosmos.reset_container_provider()
 
 
-def _create_demos_table(region: str = "us-east-1") -> None:
-    ddb = boto3.client("dynamodb", region_name=region)
-    ddb.create_table(
-        TableName=DEMOS_TABLE,
-        BillingMode="PAY_PER_REQUEST",
-        AttributeDefinitions=[{"AttributeName": "id", "AttributeType": "S"}],
-        KeySchema=[{"AttributeName": "id", "KeyType": "HASH"}],
-    )
-    ddb.get_waiter("table_exists").wait(TableName=DEMOS_TABLE)
+def _missing_provider(name):
+    """Simulates absent containers: every op raises ContainerNotFound."""
+    raise ContainerNotFound(name)
 
 
 # ---------------------------------------------------------------------------
-# Pure helper — runs WITHOUT moto / any live table.
+# Pure helper — runs WITHOUT any storage.
 # ---------------------------------------------------------------------------
 
 def test_normalize_helper_produces_tool_ids_key():
@@ -111,16 +96,14 @@ def test_from_ddb_decimal_conversion():
 
 
 # ---------------------------------------------------------------------------
-# Table-missing degrade — needs moto only to scope the (empty) AWS env, but
-# the point is that NO table exists.
+# Container-missing degrade — the point is that NO container exists.
 # ---------------------------------------------------------------------------
 
-@pytest.mark.skipif(not _HAVE_MOTO, reason="moto unavailable")
-def test_missing_table_degrades(ddb_env):
-    """No table created -> rescan degrades (no raise), get()->None, list()->[],
+def test_missing_table_degrades():
+    """No container -> rescan degrades (no raise), get()->None, list()->[],
     last_skipped records the reason; cache stays empty."""
     async def run():
-        store = DemoStore(table_name=DEMOS_TABLE)
+        store = DemoStore()
         n = await store.rescan()
         assert n == 0
         assert store.get("anything") is None
@@ -128,30 +111,32 @@ def test_missing_table_degrades(ddb_env):
         assert store.last_skipped
         assert "missing" in store.last_skipped[0]["reason"]
 
-    with mock_aws():
+    cosmos.set_container_provider(_missing_provider)
+    try:
         asyncio.run(run())
+    finally:
+        cosmos.reset_container_provider()
 
 
 # ---------------------------------------------------------------------------
-# Empty-cache tolerance BEFORE any rescan (no prewarm) — pure, no AWS.
+# Empty-cache tolerance BEFORE any rescan (no prewarm) — pure, no storage.
 # ---------------------------------------------------------------------------
 
-def test_empty_cache_before_prewarm_is_safe(ddb_env):
+def test_empty_cache_before_prewarm_is_safe():
     """get()/list() must not raise on a freshly constructed store (cache empty,
     rescan not yet awaited) — get()->None, list()->[]."""
-    store = DemoStore(table_name=DEMOS_TABLE)
+    store = DemoStore()
     assert store.get("acme-demo") is None
     assert store.list() == []
 
 
 # ---------------------------------------------------------------------------
-# Full round-trip — put -> rescan -> get/list (requires moto table).
+# Full round-trip — put -> rescan -> get/list (requires the fake container).
 # ---------------------------------------------------------------------------
 
-@pytest.mark.skipif(not _HAVE_MOTO, reason="moto unavailable")
-def test_put_get_list_roundtrip_with_tool_ids_and_decimal(ddb_env):
+def test_put_get_list_roundtrip_with_tool_ids_and_decimal(fake):
     async def run():
-        store = DemoStore(table_name=DEMOS_TABLE)
+        store = DemoStore()
         await store.put(SAMPLE_DEMO)
         n = await store.rescan()
         assert n == 1
@@ -178,7 +163,7 @@ def test_put_get_list_roundtrip_with_tool_ids_and_decimal(ddb_env):
         assert demo["mcp_servers"] == ["weather-mcp"]
         assert demo["tags"] == ["support", "demo"]
 
-        # --- Decimal -> float round-trip: filler.probability is a float ---
+        # --- number round-trip: filler.probability is a float ---
         assert demo["filler"]["probability"] == 0.35
         assert isinstance(demo["filler"]["probability"], float)
         # timeout_ms (integral) comes back as int, not Decimal.
@@ -200,16 +185,13 @@ def test_put_get_list_roundtrip_with_tool_ids_and_decimal(ddb_env):
         )
         assert s["kb_chars"] == expected_kb
 
-    with mock_aws():
-        _create_demos_table()
-        asyncio.run(run())
+    asyncio.run(run())
 
 
-@pytest.mark.skipif(not _HAVE_MOTO, reason="moto unavailable")
-def test_rescan_scans_all_items(ddb_env):
-    """rescan loads every demo in the table into the cache."""
+def test_rescan_scans_all_items(fake):
+    """rescan loads every demo in the container into the cache."""
     async def run():
-        store = DemoStore(table_name=DEMOS_TABLE)
+        store = DemoStore()
         for i in range(5):
             d = dict(SAMPLE_DEMO)
             d["id"] = f"demo-{i}"
@@ -222,27 +204,21 @@ def test_rescan_scans_all_items(ddb_env):
         for i in range(5):
             assert store.get(f"demo-{i}") is not None
 
-    with mock_aws():
-        _create_demos_table()
-        asyncio.run(run())
+    asyncio.run(run())
 
 
-@pytest.mark.skipif(not _HAVE_MOTO, reason="moto unavailable")
-def test_rescan_degrade_keeps_prior_cache(ddb_env):
-    """If a later rescan hits a missing table, the prior cache is KEPT (not
+def test_rescan_degrade_keeps_prior_cache(fake):
+    """If a later rescan hits missing storage, the prior cache is KEPT (not
     wiped) and the previous count is returned."""
     async def run():
-        store = DemoStore(table_name=DEMOS_TABLE)
+        store = DemoStore()
         await store.put(SAMPLE_DEMO)
         assert await store.rescan() == 1
-        # Point the store at a non-existent table and rescan again.
-        store._table = None
-        store._table_name = "no-such-demos-table"
+        # Point the store at missing storage and rescan again.
+        cosmos.set_container_provider(_missing_provider)
         n = await store.rescan()
         assert n == 1  # prior count preserved
         assert store.get("acme-demo") is not None  # cache intact
         assert store.last_skipped
 
-    with mock_aws():
-        _create_demos_table()
-        asyncio.run(run())
+    asyncio.run(run())

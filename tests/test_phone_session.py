@@ -13,8 +13,8 @@ Strategy: drive the *real* builders far enough to reach the
 ``FastAPIWebsocketTransport(... params=FastAPIWebsocketParams(serializer=...))``
 construction, then monkeypatch the transport class to *capture the serializer*
 and short-circuit (raise a sentinel) before any AWS/MCP/network work. This
-mirrors how tests/test_demo_translate.py monkeypatches AWSBedrockLLMService to
-capture the Settings handed to it. No real LLM/Bedrock/Twilio calls.
+mirrors how tests/test_demo_translate.py monkeypatches make_managed_llm to
+capture the model handed to it. No real LLM/Foundry/Twilio calls.
 """
 
 from __future__ import annotations

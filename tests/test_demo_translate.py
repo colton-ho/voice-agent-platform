@@ -237,21 +237,22 @@ def test_translate_success_and_system_instruction(tmp_path, fresh_runtime_json, 
     bot, _ = _bot_with_demo(tmp_path, _MANIFEST_KBPATH)
 
     captured = {}
-    _RealSettings = bot.AWSBedrockLLMService.Settings
 
-    class _FakeLLM:
-        Settings = _RealSettings  # reuse the real Settings model for fidelity
+    def _fake_make_managed_llm(*, model=None, env=None):
+        captured["model"] = model
 
-        def __init__(self, *a, **kw):
-            captured["settings"] = kw.get("settings")
+        class _FakeLLM:
+            async def complete(self, *, messages, max_tokens=None):
+                captured["messages"] = messages
+                captured["max_tokens"] = max_tokens
+                return (
+                    '{"system": "FR system verifyCustomer", '
+                    '"greeting": "Bonjour", "kb_intro": "intro fr"}'
+                )
 
-        async def run_inference(self, ctx):
-            return (
-                '{"system": "FR system verifyCustomer", '
-                '"greeting": "Bonjour", "kb_intro": "intro fr"}'
-            )
+        return _FakeLLM()
 
-    monkeypatch.setattr(bot, "AWSBedrockLLMService", _FakeLLM)
+    monkeypatch.setattr(bot, "make_managed_llm", _fake_make_managed_llm)
 
     client = TestClient(bot.app)
     r = client.post(
@@ -267,7 +268,7 @@ def test_translate_success_and_system_instruction(tmp_path, fresh_runtime_json, 
     assert body["already_exists"]["system"] is False
 
     # system_instruction must carry the identifier-preservation directive.
-    si = captured["settings"].system_instruction
+    si = next(m.content for m in captured["messages"] if m.role == "system")
     assert "verifyCustomer" in si
     assert "requestRepair" in si
     assert "woNumber" in si
@@ -283,8 +284,10 @@ def test_translate_success_and_system_instruction(tmp_path, fresh_runtime_json, 
     # When the caller does not specify a model, the translate path must default
     # to the strong TRANSLATE_MODEL — NOT the conversational DEFAULT_MODEL
     # (nova-2-lite echoes long prompts back untranslated).
-    assert captured["settings"].model == bot.MODELS[bot.TRANSLATE_MODEL]
+    assert captured["model"] == bot.MODELS[bot.TRANSLATE_MODEL]
     assert bot.MODELS[bot.TRANSLATE_MODEL] != bot.MODELS[bot.DEFAULT_MODEL]
+    # A-7/F6：翻譯 4096 原值透傳到 FC-3 調用面
+    assert captured["max_tokens"] == 4096
 
 
 def test_translate_per_field_source_fallback(tmp_path, fresh_runtime_json, monkeypatch):
@@ -305,18 +308,11 @@ kb_path: kb.md
 """
     bot, _ = _bot_with_demo(tmp_path, manifest, demo_id="fb-demo")
 
-    _RealSettings = bot.AWSBedrockLLMService.Settings
-
     class _FakeLLM:
-        Settings = _RealSettings
-
-        def __init__(self, *a, **kw):
-            pass
-
-        async def run_inference(self, ctx):
+        async def complete(self, *, messages, max_tokens=None):
             return '{"system": "sys-fr", "greeting": "greet-fr"}'
 
-    monkeypatch.setattr(bot, "AWSBedrockLLMService", _FakeLLM)
+    monkeypatch.setattr(bot, "make_managed_llm", lambda **kw: _FakeLLM())
     client = TestClient(bot.app)
     r = client.post(
         "/api/admin/demos/fb-demo/translate",
@@ -332,18 +328,11 @@ def test_translate_parse_failure_502_no_write(tmp_path, fresh_runtime_json, monk
     from fastapi.testclient import TestClient
 
     bot, _ = _bot_with_demo(tmp_path, _MANIFEST_KBPATH)
-    _RealSettings = bot.AWSBedrockLLMService.Settings
-
     class _FakeLLM:
-        Settings = _RealSettings
-
-        def __init__(self, *a, **kw):
-            pass
-
-        async def run_inference(self, ctx):
+        async def complete(self, *, messages, max_tokens=None):
             return "I'm sorry, I cannot produce JSON for this."  # unparseable
 
-    monkeypatch.setattr(bot, "AWSBedrockLLMService", _FakeLLM)
+    monkeypatch.setattr(bot, "make_managed_llm", lambda **kw: _FakeLLM())
     client = TestClient(bot.app)
     r = client.post(
         "/api/admin/demos/trans-demo/translate",

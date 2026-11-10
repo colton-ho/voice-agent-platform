@@ -1,10 +1,10 @@
-"""T7 — integration checkpoint: moto end-to-end across the REAL Demo-in-DDB modules.
+"""T7 — integration checkpoint: end-to-end across the REAL Demo-in-storage modules.
 
 This is the cross-module contract proof demanded by reviewer BLOCKER #2 (the
 6-task DAG had no integration checkpoint). Unlike the per-module unit tests
 (test_demo_store / test_migrate_demos / test_admin_api filler cases), every test
-here wires the *actual* modules together against a single moto-mocked DynamoDB
-table — no isolated mocks of the collaborators:
+here wires the *actual* modules together against a single in-memory Cosmos fake
+container — no isolated mocks of the collaborators:
 
   * scripts.migrate_demos_to_ddb.migrate()  — the real migration entry fn
   * demo_store.DemoStore                     — rescan / get / list / put
@@ -14,13 +14,13 @@ table — no isolated mocks of the collaborators:
   * timeout_filler.TimeoutFillerObserver     — the filler.probability consumer
 
 Coverage (task ACs):
-  1. Empty table: DemoStore.rescan() -> list() == []  (documented "pre-migration
-     empty table" degrade — no crash).
-  2. Migration: run migrate() against the real data/ into DemosTable ->
+  1. Empty container: DemoStore.rescan() -> list() == []  (documented
+     "pre-migration empty container" degrade — no crash).
+  2. Migration: run migrate() against the real data/ into the demos container ->
      DemoStore.rescan() -> get(id) returns a full dict CONTAINING `tool_ids`;
      list() shape == {id,label,lang,kb_chars}.
   3. Full-field PATCH: admin_demo_patch (via TestClient) changes
-     label + system[lang] + kb_body + filler -> writes DDB -> rescan ->
+     label + system[lang] + kb_body + filler -> writes storage -> rescan ->
      get(id) reflects ALL updates.
   4. tool_ids end-to-end: migrate it-helpdesk (end_call/transfer_to_human) ->
      get -> tool_ids non-empty AND get_tool_defs(tool_ids, scope) resolves
@@ -28,10 +28,9 @@ Coverage (task ACs):
   5. filler.probability is a float (not Decimal) on read-back, i.e. it can be
      handed to TimeoutFillerObserver.
 
-moto availability: moto IS present in this repo's dev venv (it backs
-test_admin_api), so the full path runs. The fallback note (table-missing
-degrade + pure-function chaining) is documented in the task report; AC1 already
-exercises the degrade-on-empty branch.
+Storage is the in-memory Cosmos fake (tests/fake_cosmos.py) injected through
+the storage.cosmos provider seam. AC1 already exercises the degrade-on-empty
+branch.
 """
 
 import asyncio
@@ -39,18 +38,17 @@ import importlib
 import os
 import sys
 
-import boto3
 import pytest
-from moto import mock_aws
+
+from fake_cosmos import FakeCosmos
+from storage import cosmos
 
 # The full-link PATCH path logs in through user_store -> bcrypt. Without bcrypt
 # the login path raises AuthUnavailable; skip the whole module (mirrors
-# test_admin_api). moto is likewise required for the in-memory DDB.
+# test_admin_api).
 pytest.importorskip("bcrypt")
-pytest.importorskip("moto")
 
-USERS_TABLE = "voicebot-t7-users"
-DEMOS_TABLE = "voicebot-t7-demos"
+
 _ADMIN_PWD = "test-pwd"
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -61,20 +59,9 @@ _TOOLS_DEMO_ID = "it-helpdesk"  # carries end_call + transfer_to_human
 _PATCH_DEMO_ID = "it-helpdesk"
 
 
-def _create_table(name: str, key: str, region: str = "us-east-1") -> None:
-    ddb = boto3.client("dynamodb", region_name=region)
-    ddb.create_table(
-        TableName=name,
-        BillingMode="PAY_PER_REQUEST",
-        AttributeDefinitions=[{"AttributeName": key, "AttributeType": "S"}],
-        KeySchema=[{"AttributeName": key, "KeyType": "HASH"}],
-    )
-    ddb.get_waiter("table_exists").wait(TableName=name)
-
-
 @pytest.fixture(autouse=True)
 def aws_env(monkeypatch):
-    """Point bot.py's module-level singletons at the moto tables + dummy creds.
+    """Point bot.py's module-level singletons at the fake containers.
 
     Same env contract as test_admin_api: ADMIN_PASSWORD is unused (the bootstrap
     admin is created explicitly), AUTH_SECRET stabilizes JWTs, and MINIMAX_API_KEY
@@ -82,21 +69,15 @@ def aws_env(monkeypatch):
     """
     monkeypatch.setenv("ADMIN_PASSWORD", _ADMIN_PWD)
     monkeypatch.setenv("AUTH_SECRET", "test-secret")
-    monkeypatch.setenv("USERS_TABLE", USERS_TABLE)
-    monkeypatch.setenv("DEMOS_TABLE", DEMOS_TABLE)
-    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
-    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "testing")
-    monkeypatch.setenv("AWS_DEFAULT_REGION", "us-east-1")
-    monkeypatch.setenv("AWS_REGION", "us-east-1")
     monkeypatch.setenv("MINIMAX_API_KEY", "x")
-    with mock_aws():
-        _create_table(USERS_TABLE, "username")
-        _create_table(DEMOS_TABLE, "id")
-        yield
+    f = FakeCosmos()
+    cosmos.set_container_provider(f)
+    yield f
+    cosmos.reset_container_provider()
 
 
 def _import_app():
-    """(Re-)import bot.py fresh so module-level singletons see the moto env."""
+    """(Re-)import bot.py fresh so module-level singletons see the env."""
     for mod in list(sys.modules):
         if mod in ("bot", "runtime_config", "demo_store", "demo_loader", "user_store"):
             del sys.modules[mod]
@@ -117,7 +98,7 @@ def _admin_client(bot):
 
 def _run_real_migration(bot, *, overwrite: bool = False) -> dict:
     """Run the REAL migration entry function against the repo data/ root,
-    writing into the bot's DDB-backed DemoStore singleton (same moto table).
+    writing into the bot's storage-backed DemoStore singleton (same container).
 
     We pass bot.DEMO_LOADER as the store so the migration, the PATCH endpoint,
     and the read-back assertions all share one DemoStore/cache — exercising the
@@ -137,7 +118,7 @@ def test_empty_table_rescan_degrades_to_empty_list():
     """Pre-migration empty table: rescan() loads 0 demos and list()/get() are
     empty — no crash (documented degrade)."""
     bot = _import_app()
-    store = bot.DEMO_LOADER  # DDB-backed DemoStore pointed at the empty moto table
+    store = bot.DEMO_LOADER  # DDB-backed DemoStore pointed at the empty container
 
     count = asyncio.run(store.rescan())
     assert count == 0
@@ -224,8 +205,8 @@ def test_full_field_patch_writes_ddb_and_reads_back():
     assert after["kb_body"] == new_kb_body
     assert after["filler"] == new_filler
 
-    # A truly independent read (fresh rescan from the moto table, not the cache
-    # the PATCH left behind) must show the same — proves it hit DynamoDB.
+    # A truly independent read (fresh rescan from the container, not the cache
+    # the PATCH left behind) must show the same — proves it hit storage.
     asyncio.run(store.rescan())
     reread = store.get(_PATCH_DEMO_ID)
     assert reread["label"] == new_label
@@ -275,8 +256,8 @@ def test_filler_probability_is_float_after_ddb_roundtrip():
     asyncio.run(store.rescan())
 
     # No data/ demo ships a filler block, so PATCH one in (fractional probability
-    # is the Decimal/float trap: bot._to_ddb writes Decimal, _from_ddb must read
-    # back a float).
+    # is the Decimal/float trap: the DDB-era write path wrote Decimal —
+    # bot._to_ddb retired with F-16 —, _from_ddb must read back a float).
     r = client.patch(
         f"/api/admin/demos/{_PATCH_DEMO_ID}",
         json={"filler": {"enabled": True, "timeout_ms": 700, "probability": 0.25}},
@@ -318,7 +299,7 @@ def test_filler_probability_is_float_after_ddb_roundtrip():
 
 # ---------------------------------------------------------------------------
 # asr_filter — per-demo PATCH writes DDB and survives a fresh rescan, with the
-# min_confidence float surviving the Decimal round-trip (ASR-filter task §5/§8)
+# min_confidence float surviving the number round-trip (ASR-filter task §5/§8)
 # ---------------------------------------------------------------------------
 def test_asr_filter_patch_writes_ddb_and_reads_back():
     bot = _import_app()
@@ -339,7 +320,7 @@ def test_asr_filter_patch_writes_ddb_and_reads_back():
     assert after["asr_filter"] == new_asr
     assert isinstance(after["asr_filter"]["min_confidence"], float)
 
-    # Independent re-read from the moto table (not the cache the PATCH left).
+    # Independent re-read from the container (not the cache the PATCH left).
     asyncio.run(store.rescan())
     reread = store.get(_PATCH_DEMO_ID)
     assert reread["asr_filter"] == new_asr

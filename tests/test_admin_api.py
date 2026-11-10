@@ -10,8 +10,8 @@ verify:
 - /api/admin/demos/rescan re-discovers a freshly-added demo
 - /api/config (Web) reads runtime defaults
 
-Auth model: bot.py uses a DynamoDB user table + bcrypt + JWT cookie (replacing
-the old Basic Auth). These tests stand up a moto-mocked users table seeded with
+Auth model: bot.py uses a Cosmos user container + bcrypt + JWT cookie (replacing
+the old Basic Auth). These tests stand up fake Cosmos containers seeded with
 an admin and log in to obtain the vb_session cookie; TestClient persists the
 cookie across requests, so per-request calls no longer carry an auth header.
 
@@ -25,9 +25,10 @@ import importlib
 import os
 import sys
 
-import boto3
 import pytest
-from moto import mock_aws
+
+from fake_cosmos import FakeCosmos
+from storage import cosmos
 
 # These integration tests log in through user_store, which requires bcrypt for
 # password hashing. In environments without bcrypt the whole login path raises
@@ -35,94 +36,66 @@ from moto import mock_aws
 # is also covered, bcrypt-free, in tests/test_timeout_filler.py).
 pytest.importorskip("bcrypt")
 
-USERS_TABLE = "voicebot-test-admin-api-users"
-DEMOS_TABLE = "voicebot-test-admin-api-demos"
-VOICES_TABLE = "voicebot-test-admin-api-voices"
-ACTIVITY_TABLE = "voicebot-test-admin-api-activity"
+
 _ADMIN_PWD = "test-pwd"
 
 
-def _create_users_table(region: str = "us-east-1") -> None:
-    ddb = boto3.client("dynamodb", region_name=region)
-    ddb.create_table(
-        TableName=USERS_TABLE,
-        BillingMode="PAY_PER_REQUEST",
-        AttributeDefinitions=[{"AttributeName": "username", "AttributeType": "S"}],
-        KeySchema=[{"AttributeName": "username", "KeyType": "HASH"}],
-    )
-    ddb.get_waiter("table_exists").wait(TableName=USERS_TABLE)
+class _SelectiveCosmos:
+    """FakeCosmos wrapper simulating a partially-provisioned account: any
+    container in ``absent`` raises ContainerNotFound at resolution (the old
+    missing-table path); the rest delegate to a shared FakeCosmos. The
+    ``_create_*_table`` helpers below "create" a table by discarding it from
+    ``absent`` — same call sites as the moto era."""
+
+    def __init__(self, absent):
+        self.fake = FakeCosmos()
+        self.absent = set(absent)
+
+    def __call__(self, name):
+        if name in self.absent:
+            raise cosmos.ContainerNotFound(name)
+        return self.fake.container(name)
 
 
-def _create_demos_table(region: str = "us-east-1") -> None:
-    ddb = boto3.client("dynamodb", region_name=region)
-    ddb.create_table(
-        TableName=DEMOS_TABLE,
-        BillingMode="PAY_PER_REQUEST",
-        AttributeDefinitions=[{"AttributeName": "id", "AttributeType": "S"}],
-        KeySchema=[{"AttributeName": "id", "KeyType": "HASH"}],
-    )
-    ddb.get_waiter("table_exists").wait(TableName=DEMOS_TABLE)
+_prov: _SelectiveCosmos | None = None
 
 
-def _create_voices_table(region: str = "us-east-1") -> None:
-    ddb = boto3.client("dynamodb", region_name=region)
-    ddb.create_table(
-        TableName=VOICES_TABLE,
-        BillingMode="PAY_PER_REQUEST",
-        AttributeDefinitions=[
-            {"AttributeName": "provider", "AttributeType": "S"},
-            {"AttributeName": "voice_id", "AttributeType": "S"},
-        ],
-        KeySchema=[
-            {"AttributeName": "provider", "KeyType": "HASH"},
-            {"AttributeName": "voice_id", "KeyType": "RANGE"},
-        ],
-    )
-    ddb.get_waiter("table_exists").wait(TableName=VOICES_TABLE)
+def _create_users_table() -> None:
+    _prov.absent.discard(cosmos.USERS)
 
 
-def _create_activity_table(region: str = "us-east-1") -> None:
-    ddb = boto3.client("dynamodb", region_name=region)
-    ddb.create_table(
-        TableName=ACTIVITY_TABLE,
-        BillingMode="PAY_PER_REQUEST",
-        AttributeDefinitions=[
-            {"AttributeName": "day", "AttributeType": "S"},
-            {"AttributeName": "ts_id", "AttributeType": "S"},
-        ],
-        KeySchema=[
-            {"AttributeName": "day", "KeyType": "HASH"},
-            {"AttributeName": "ts_id", "KeyType": "RANGE"},
-        ],
-    )
-    ddb.get_waiter("table_exists").wait(TableName=ACTIVITY_TABLE)
+def _create_demos_table() -> None:
+    _prov.absent.discard(cosmos.DEMOS)
+
+
+def _create_voices_table() -> None:
+    _prov.absent.discard(cosmos.VOICES)
+
+
+def _create_activity_table() -> None:
+    _prov.absent.discard(cosmos.ACTIVITY)
 
 
 @pytest.fixture(autouse=True)
 def auth_env(monkeypatch):
+    global _prov
     # ADMIN_PASSWORD seeds the bootstrap admin on startup; AUTH_SECRET keeps
-    # JWTs stable; USERS_TABLE points at the moto-mocked table.
+    # JWTs stable.
     monkeypatch.setenv("ADMIN_PASSWORD", _ADMIN_PWD)
     monkeypatch.setenv("AUTH_SECRET", "test-secret")
-    monkeypatch.setenv("USERS_TABLE", USERS_TABLE)
-    monkeypatch.setenv("DEMOS_TABLE", DEMOS_TABLE)
-    # Point VOICE_STORE at a test table NAME, but DON'T create it here — most
-    # tests want the table-missing fallback (voices_for -> in-code constants).
-    # The voice-registry tests below create it explicitly.
-    monkeypatch.setenv("VOICES_TABLE", VOICES_TABLE)
-    # ActivityStore points at the test table NAME but it is NOT created here —
-    # most tests want the table-missing best-effort no-op (zero-impact). The
-    # activity-log tests below create it explicitly.
-    monkeypatch.setenv("ACTIVITY_TABLE", ACTIVITY_TABLE)
-    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
-    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "testing")
-    monkeypatch.setenv("AWS_DEFAULT_REGION", "us-east-1")
-    monkeypatch.setenv("AWS_REGION", "us-east-1")
+    # B10（BC-c1）：表名 env 退役——容器隔离全走 _SelectiveCosmos provider。
+    # voices/activity 容器缺省不建（多数测试要 table-missing 兜底：voices_for
+    # -> 常量；activity -> 零影响 no-op），下方 registry/activity 测试自建。
     monkeypatch.setenv("MINIMAX_API_KEY", "x")  # bot.py imports succeed even w/o real key
-    with mock_aws():
-        _create_users_table()
-        _create_demos_table()
-        yield
+    # All four containers start absent; the fixture "creates" users/demos and
+    # the tests below create voices/activity on demand (same call sites).
+    _prov = _SelectiveCosmos(absent={cosmos.USERS, cosmos.DEMOS, cosmos.VOICES, cosmos.ACTIVITY})
+    cosmos.set_container_provider(_prov)
+    _create_users_table()
+    _create_demos_table()
+    yield
+    cosmos.reset_container_provider()
+    _prov = None
 
 
 @pytest.fixture
@@ -225,26 +198,30 @@ def test_phone_put_persists_and_hot_reloads(tmp_path, monkeypatch):
     bot = _import_app()
     client = _admin_client(bot)
 
-    # Snapshot before
-    before = client.get("/api/admin/config", headers=_basic()).json()
-    original_engine = before["phone"]["engine"]
-    new_engine = "pipeline" if original_engine == "nova-sonic" else "nova-sonic"
-
-    # PUT change
+    # Re-pointed (ruling B 2026-11-09): nova-sonic left ENGINES — switching to
+    # it is rejected (C-3 visible capability reduction).
     r = client.put(
         "/api/admin/config/phone",
         headers=_basic(),
-        json={"engine": new_engine},
+        json={"engine": "nova-sonic"},
+    )
+    assert r.status_code == 400, r.text
+
+    # PUT the only selectable engine
+    r = client.put(
+        "/api/admin/config/phone",
+        headers=_basic(),
+        json={"engine": "pipeline"},
     )
     assert r.status_code == 200, r.text
-    assert r.json()["phone"]["engine"] == new_engine
+    assert r.json()["phone"]["engine"] == "pipeline"
 
     # GET reflects change
     after = client.get("/api/admin/config", headers=_basic()).json()
-    assert after["phone"]["engine"] == new_engine
+    assert after["phone"]["engine"] == "pipeline"
 
     # Module-level RUNTIME_CONFIG agrees
-    assert bot.RUNTIME_CONFIG.get_phone_defaults()["engine"] == new_engine
+    assert bot.RUNTIME_CONFIG.get_phone_defaults()["engine"] == "pipeline"
 
 
 def test_phone_put_rejects_invalid_engine(tmp_path, monkeypatch):
@@ -259,7 +236,8 @@ def test_phone_put_rejects_invalid_engine(tmp_path, monkeypatch):
     assert r.status_code == 400
 
 
-# Repo data/ root — seeded into the moto DEMOS table for the real-demo tests.
+# Repo data/ root — seeded into the fake Cosmos demos container for the
+# real-demo tests.
 _REPO_DATA_ROOT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
 
 
@@ -267,7 +245,7 @@ def test_admin_demos_lists_acme_security(tmp_path, monkeypatch):
     from fastapi.testclient import TestClient
     bot = _import_app()
     client = _admin_client(bot)
-    _seed_demos_into_ddb(bot, _REPO_DATA_ROOT)
+    _seed_demos_into_store(bot, _REPO_DATA_ROOT)
     r = client.get("/api/admin/demos", headers=_basic())
     assert r.status_code == 200
     ids = [d["id"] for d in r.json()["demos"]]
@@ -278,7 +256,7 @@ def test_admin_demos_rescan(tmp_path, monkeypatch):
     from fastapi.testclient import TestClient
     bot = _import_app()
     client = _admin_client(bot)
-    _seed_demos_into_ddb(bot, _REPO_DATA_ROOT)
+    _seed_demos_into_store(bot, _REPO_DATA_ROOT)
     r = client.post("/api/admin/demos/rescan", headers=_basic())
     assert r.status_code == 200
     assert r.json()["count"] >= 1
@@ -288,7 +266,7 @@ def test_admin_demo_detail(tmp_path, monkeypatch):
     from fastapi.testclient import TestClient
     bot = _import_app()
     client = _admin_client(bot)
-    _seed_demos_into_ddb(bot, _REPO_DATA_ROOT)
+    _seed_demos_into_store(bot, _REPO_DATA_ROOT)
     r = client.get("/api/admin/demos/acme-security-support", headers=_basic())
     assert r.status_code == 200
     out = r.json()
@@ -323,6 +301,23 @@ def test_admin_options_payload(tmp_path, monkeypatch):
     data = r.json()
     for key in ("languages", "engines", "providers", "models", "scenarios", "voices_by_provider"):
         assert key in data
+
+
+def test_models_payload_shape_and_label_source(tmp_path, monkeypatch):
+    """#16 A-2：两处 models[] payload 同形——label 取 LABELS（B9），
+    id/bedrock_id 字段名冻结不动（C-2），bedrock_id 值=MODELS 值（名不动值重指）。"""
+    bot = _import_app()
+    client = _admin_client(bot)
+    expected = [
+        {"id": k, "label": bot.LABELS[k], "bedrock_id": v}
+        for k, v in bot.MODELS.items()
+    ]
+    opts = client.get("/api/admin/options", headers=_basic())
+    assert opts.status_code == 200
+    assert opts.json()["models"] == expected
+    cfg = client.get("/api/config")
+    assert cfg.status_code == 200
+    assert cfg.json()["models"] == expected
 
 
 def test_api_config_uses_runtime_config(tmp_path, monkeypatch):
@@ -370,12 +365,13 @@ def _write_filler_demo(data_root, filler_block=None):
     return demo_dir
 
 
-def _seed_demos_into_ddb(bot, data_root):
+def _seed_demos_into_store(bot, data_root):
     """Load every demo under ``data_root`` from disk via DemoLoader and put()
-    each into the DDB-backed DemoStore, then rescan so get()/list() see them.
+    each into the Cosmos-backed DemoStore, then rescan so get()/list() see them.
 
-    DEMO_LOADER is now the DDB-backed DemoStore (T3); it does not scan disk, so
-    tests seed the moto table the same way the T4 migration / PATCH bridge do."""
+    DEMO_LOADER is now the Cosmos-backed DemoStore (T3); it does not scan disk,
+    so tests seed the container the same way the T4 migration / PATCH bridge
+    do."""
     import asyncio
     from demo_loader import DemoLoader
 
@@ -387,16 +383,16 @@ def _seed_demos_into_ddb(bot, data_root):
 
 def _point_loader_at(bot, data_root):
     """Point the PATCH endpoint's on-disk authoring root at a temp dir AND seed
-    the DDB-backed DemoStore from it, so the PATCH endpoint writes to a
+    the Cosmos-backed DemoStore from it, so the PATCH endpoint writes to a
     throwaway manifest (never the repo's data/) and the store serves it."""
     bot.DATA_ROOT = str(data_root)
-    _seed_demos_into_ddb(bot, data_root)
+    _seed_demos_into_store(bot, data_root)
 
 
 def _store_filler(bot, demo_id):
-    """Read the demo's ``filler`` block back from the DDB-backed store.
+    """Read the demo's ``filler`` block back from the Cosmos-backed store.
 
-    T5 stopped writing manifest.yaml — DynamoDB is the single source of truth —
+    T5 stopped writing manifest.yaml — the store is the single source of truth —
     so filler read-back now goes through DEMO_LOADER.get (cache refreshed by the
     PATCH endpoint's rescan), not the on-disk manifest."""
     demo = bot.DEMO_LOADER.get(demo_id)
@@ -424,7 +420,7 @@ def test_patch_demo_filler_only_not_blocked_by_has_content(tmp_path, monkeypatch
 
 
 def test_patch_demo_filler_valid_persists_and_reads_back(tmp_path, monkeypatch):
-    """Valid filler → 200, DDB store read-back contains the block, and GET
+    """Valid filler → 200, store read-back contains the block, and GET
     detail returns it."""
     from fastapi.testclient import TestClient  # noqa: F401
 
@@ -442,7 +438,7 @@ def test_patch_demo_filler_valid_persists_and_reads_back(tmp_path, monkeypatch):
     )
     assert r.status_code == 200, r.text
 
-    # Read-back from the DDB-backed store (probability comes back as a float,
+    # Read-back from the store (probability comes back as a float,
     # not a Decimal — _from_ddb round-trip).
     in_store = _store_filler(bot, _FILLER_DEMO_ID)
     assert in_store == {"enabled": True, "timeout_ms": 900, "probability": 0.3}
@@ -471,7 +467,7 @@ def test_patch_demo_filler_valid_persists_and_reads_back(tmp_path, monkeypatch):
 )
 def test_patch_demo_filler_invalid_rejected_and_store_unchanged(tmp_path, monkeypatch, bad_filler):
     """Each invalid sub-value → 400 AND the stored filler block is untouched
-    (no partial write to DDB before the raise)."""
+    (no partial write to the store before the raise)."""
     from fastapi.testclient import TestClient  # noqa: F401
 
     bot = _import_app()
@@ -544,14 +540,14 @@ def test_patch_demo_omitting_filler_leaves_it_untouched(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 def _store_model(bot, demo_id):
-    """Read the demo's persisted ``model`` back from the DDB-backed store."""
+    """Read the demo's persisted ``model`` back from the store."""
     demo = bot.DEMO_LOADER.get(demo_id)
     return (demo or {}).get("model")
 
 
 def test_patch_demo_model_only_persists_to_store_and_detail(tmp_path, monkeypatch):
     """BLOCKER-1: a model-only PATCH must (a) not be blocked by has_content,
-    (b) actually reach `merged` and persist to the DDB store (the merge-loop
+    (b) actually reach `merged` and persist to the store (the merge-loop
     fix), and (c) surface in GET detail."""
     bot = _import_app()
     client = _admin_client(bot)
@@ -620,12 +616,12 @@ def test_patch_demo_explicit_null_model_clears(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# PATCH /api/admin/demos/{id} — full-field editor, DDB-backed (T5)
+# PATCH /api/admin/demos/{id} — full-field editor, store-backed (T5)
 # ---------------------------------------------------------------------------
 
 
 def _setup_full_field_demo(bot, tmp_path):
-    """Seed a minimal demo into the DDB store and return (client, demo_root)."""
+    """Seed a minimal demo into the store and return (client, demo_root)."""
     demo_root = tmp_path / "data"
     demo_root.mkdir()
     _write_filler_demo(demo_root)
@@ -634,7 +630,7 @@ def _setup_full_field_demo(bot, tmp_path):
 
 def test_patch_demo_label_only_not_blocked_and_persists(tmp_path, monkeypatch):
     """has_content gate includes label: a label-only body is NOT 400'd, and the
-    new label is read back from the DDB store after rescan."""
+    new label is read back from the store after rescan."""
     bot = _import_app()
     client = _admin_client(bot)
     _setup_full_field_demo(bot, tmp_path)
@@ -791,7 +787,7 @@ def test_patch_demo_id_change_rejected_but_no_op_id_ok(tmp_path, monkeypatch):
 
 
 def test_patch_demo_tools_persist_to_ddb_under_tool_ids(tmp_path, monkeypatch):
-    """tools (no regression) now persist to DDB under the internal tool_ids
+    """tools (no regression) now persist to the store under the internal tool_ids
     key, readable back after rescan."""
     bot = _import_app()
     client = _admin_client(bot)
@@ -808,7 +804,7 @@ def test_patch_demo_tools_persist_to_ddb_under_tool_ids(tmp_path, monkeypatch):
 
 
 def test_patch_demo_localized_persists_to_ddb(tmp_path, monkeypatch):
-    """localized fine-grained write-back (no regression) now lands in DDB."""
+    """localized fine-grained write-back (no regression) now lands in the store."""
     bot = _import_app()
     client = _admin_client(bot)
     _setup_full_field_demo(bot, tmp_path)
@@ -831,7 +827,7 @@ def test_patch_demo_localized_persists_to_ddb(tmp_path, monkeypatch):
 
 
 def test_patch_demo_engine_voice_provider_persists_and_reads_back(tmp_path, monkeypatch):
-    """A valid pipeline engine+provider+voice PATCH → 200, persists to the DDB
+    """A valid pipeline engine+provider+voice PATCH → 200, persists to the store
     store, and GET detail returns all three (editor seed)."""
     bot = _import_app()
     client = _admin_client(bot)
@@ -863,13 +859,15 @@ def test_patch_demo_engine_only_not_blocked_by_has_content(tmp_path, monkeypatch
     client = _admin_client(bot)
     _setup_full_field_demo(bot, tmp_path)
 
+    # Re-pointed data (ruling B 2026-11-09): nova-sonic left ENGINES — the
+    # engine-only-vs-has_content rule under test is unchanged.
     r = client.patch(
         f"/api/admin/demos/{_FILLER_DEMO_ID}",
         headers=_basic(),
-        json={"engine": "nova-sonic"},
+        json={"engine": "pipeline"},
     )
     assert r.status_code == 200, r.text
-    assert bot.DEMO_LOADER.get(_FILLER_DEMO_ID)["engine"] == "nova-sonic"
+    assert bot.DEMO_LOADER.get(_FILLER_DEMO_ID)["engine"] == "pipeline"
 
 
 def test_patch_demo_null_clears_engine_voice(tmp_path, monkeypatch):
@@ -878,11 +876,12 @@ def test_patch_demo_null_clears_engine_voice(tmp_path, monkeypatch):
     client = _admin_client(bot)
     _setup_full_field_demo(bot, tmp_path)
 
-    # First set them.
+    # First set them. Re-pointed data (ruling B 2026-11-09): the selectable
+    # pipeline engine + a voice from the demo's effective (minimax) table.
     r = client.patch(
         f"/api/admin/demos/{_FILLER_DEMO_ID}",
         headers=_basic(),
-        json={"engine": "nova-sonic", "voice": "tiffany"},
+        json={"engine": "pipeline", "voice": "Cantonese_GentleLady"},
     )
     assert r.status_code == 200, r.text
     # Then clear with explicit nulls.
@@ -898,9 +897,10 @@ def test_patch_demo_null_clears_engine_voice(tmp_path, monkeypatch):
 
 
 def test_patch_demo_nova_with_tools_accepted_and_persisted(tmp_path, monkeypatch):
-    """Regression-direction: setting engine=nova-sonic on a demo that ALSO has
-    tools (set in the SAME PATCH) is now ACCEPTED (Nova Sonic supports
-    function-calling) — previously this returned 400. Both fields persist."""
+    """Regression-direction: setting engine on a demo that ALSO has tools (set
+    in the SAME PATCH) is ACCEPTED — no tools→engine coupling exists. Both
+    fields persist. Re-pointed data (ruling B 2026-11-09): nova-sonic left
+    ENGINES, so the engine under test is the selectable pipeline."""
     bot = _import_app()
     client = _admin_client(bot)
     _setup_full_field_demo(bot, tmp_path)
@@ -912,11 +912,11 @@ def test_patch_demo_nova_with_tools_accepted_and_persisted(tmp_path, monkeypatch
     r = client.patch(
         f"/api/admin/demos/{_FILLER_DEMO_ID}",
         headers=_basic(),
-        json={"engine": "nova-sonic", "tools": [a_tool]},
+        json={"engine": "pipeline", "tools": [a_tool]},
     )
     assert r.status_code == 200, r.text
     demo = bot.DEMO_LOADER.get(_FILLER_DEMO_ID)
-    assert demo["engine"] == "nova-sonic"
+    assert demo["engine"] == "pipeline"
     assert demo["tool_ids"] == [a_tool]
 
 
@@ -948,10 +948,10 @@ def test_patch_demo_engine_voice_invalid_rejected(tmp_path, monkeypatch, bad_bod
 # ===========================================================================
 # Voice registry admin API + voices_for fallback (T2 / Part A)
 # ===========================================================================
-# Most tests above run with VOICES_TABLE pointing at a NON-existent table, so
-# VOICE_STORE is NOT live and voices_for() returns the in-code constants
-# (byte-identical fallback). The CRUD tests below create the table first and
-# trigger the lifespan seed via the TestClient context manager.
+# Most tests above run with the voices container absent, so VOICE_STORE is NOT
+# live and voices_for() returns the in-code constants (byte-identical
+# fallback). The CRUD tests below create the container first and trigger the
+# lifespan seed via the TestClient context manager.
 
 
 def test_voices_fallback_constants_when_table_missing(tmp_path, monkeypatch):
@@ -974,8 +974,10 @@ def test_voices_fallback_constants_when_table_missing(tmp_path, monkeypatch):
     assert bot._resolve_minimax_voice("NoSuchVoice")[0] == bot.DEFAULT_MINIMAX_VOICE
     assert bot._resolve_polly_voice("NoSuchVoice")[0] == bot.DEFAULT_POLLY_VOICE
 
-    # Nova alias still resolves through voices_for (alias applied BEFORE lookup).
-    assert bot.NOVA_SONIC_VOICE_ALIASES["marie"] in bot.voices_for("nova-sonic")
+    # Re-pointed (ruling B 2026-11-09): C-3 empties the alias map with the
+    # roster — nothing to resolve, and voices_for returns the emptied constant.
+    assert bot.NOVA_SONIC_VOICE_ALIASES == {}
+    assert bot.voices_for("nova-sonic") == {}
 
     # /api/config voices reflect the constants.
     cfg = client.get("/api/config").json()
@@ -1042,8 +1044,8 @@ def test_voice_crud_roundtrip_and_seed(tmp_path, monkeypatch):
 
 
 def test_voice_crud_nova_and_polly(tmp_path, monkeypatch):
-    """nova-sonic + polly POST round-trip, and a deleted nova voice falls back
-    to the default while its alias still resolves to a live voice."""
+    """nova-sonic + polly POST round-trip (custom rows survive C-3 — the voice
+    registry/store layer is untouched), and the emptied alias map is pinned."""
     bot = _import_app()
     _create_voices_table()
     client = _admin_client(bot)
@@ -1066,9 +1068,9 @@ def test_voice_crud_nova_and_polly(tmp_path, monkeypatch):
     assert r.status_code == 200, r.text
     assert bot._resolve_polly_voice("pollycustom") == ("pollycustom", "neural")
 
-    # Nova alias still resolves (alias map applied BEFORE registry lookup):
-    # 'marie' -> 'ambre', which is seeded + live.
-    assert bot.NOVA_SONIC_VOICE_ALIASES.get("marie", "marie") in bot.voices_for("nova-sonic")
+    # Re-pointed (ruling B 2026-11-09): the alias map is emptied with the C-3
+    # roster — no alias resolution remains.
+    assert bot.NOVA_SONIC_VOICE_ALIASES == {}
 
 
 @pytest.mark.parametrize(
@@ -1149,8 +1151,8 @@ def test_voice_without_label_does_not_break_config(tmp_path, monkeypatch):
 
 
 # --- Activity audit log (T3 / Part B) integration -------------------------
-# These exercise the REAL FastAPI routes end-to-end against a moto-mocked
-# ActivityTable: a write-emitting endpoint (voice POST) lands a retrievable row
+# These exercise the REAL FastAPI routes end-to-end against the fake Cosmos
+# activity container: a write-emitting endpoint (voice POST) lands a retrievable row
 # via GET /api/admin/activity; a failed login records status=failure WITHOUT a
 # password; the default-deny redaction holds at the store layer; and the
 # table-missing degrade leaves the underlying op working.

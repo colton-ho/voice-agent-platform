@@ -12,82 +12,37 @@ Covers tech_design §2/§4/§6 (task T1):
 - Defense-in-depth: a guest cookie is 403'd on a sample /api/admin/* yet 200 on
   /api/config and can mint /api/ws-token.
 
-Reuses the bcrypt-free / moto / TestClient patterns from tests/test_admin_api.py
+Reuses the store-fixture / TestClient patterns from tests/test_admin_api.py
 (an admin is created via the store, then logs in to obtain the vb_session
-cookie). The guest paths themselves need no bcrypt, but the admin login that
-mints links does, so the whole module importorskips bcrypt like test_admin_api.
+cookie). Storage is the in-memory Cosmos fake injected through the
+storage.cosmos provider seam. The guest paths themselves need no bcrypt, but
+the admin login that mints links does, so the whole module importorskips
+bcrypt like test_admin_api.
 """
 
 import importlib
 import sys
 import time
 
-import boto3
 import pytest
-from moto import mock_aws
+
+from fake_cosmos import FakeCosmos
+from storage import cosmos
 
 pytest.importorskip("bcrypt")
 
-USERS_TABLE = "voicebot-test-guest-link-users"
-DEMOS_TABLE = "voicebot-test-guest-link-demos"
-ACTIVITY_TABLE = "voicebot-test-guest-link-activity"
+
 _ADMIN_PWD = "test-pwd"
-
-
-def _create_users_table(region: str = "us-east-1") -> None:
-    ddb = boto3.client("dynamodb", region_name=region)
-    ddb.create_table(
-        TableName=USERS_TABLE,
-        BillingMode="PAY_PER_REQUEST",
-        AttributeDefinitions=[{"AttributeName": "username", "AttributeType": "S"}],
-        KeySchema=[{"AttributeName": "username", "KeyType": "HASH"}],
-    )
-    ddb.get_waiter("table_exists").wait(TableName=USERS_TABLE)
-
-
-def _create_demos_table(region: str = "us-east-1") -> None:
-    ddb = boto3.client("dynamodb", region_name=region)
-    ddb.create_table(
-        TableName=DEMOS_TABLE,
-        BillingMode="PAY_PER_REQUEST",
-        AttributeDefinitions=[{"AttributeName": "id", "AttributeType": "S"}],
-        KeySchema=[{"AttributeName": "id", "KeyType": "HASH"}],
-    )
-    ddb.get_waiter("table_exists").wait(TableName=DEMOS_TABLE)
-
-
-def _create_activity_table(region: str = "us-east-1") -> None:
-    ddb = boto3.client("dynamodb", region_name=region)
-    ddb.create_table(
-        TableName=ACTIVITY_TABLE,
-        BillingMode="PAY_PER_REQUEST",
-        AttributeDefinitions=[
-            {"AttributeName": "day", "AttributeType": "S"},
-            {"AttributeName": "ts_id", "AttributeType": "S"},
-        ],
-        KeySchema=[
-            {"AttributeName": "day", "KeyType": "HASH"},
-            {"AttributeName": "ts_id", "KeyType": "RANGE"},
-        ],
-    )
-    ddb.get_waiter("table_exists").wait(TableName=ACTIVITY_TABLE)
 
 
 @pytest.fixture(autouse=True)
 def auth_env(monkeypatch):
     monkeypatch.setenv("AUTH_SECRET", "test-secret")
-    monkeypatch.setenv("USERS_TABLE", USERS_TABLE)
-    monkeypatch.setenv("DEMOS_TABLE", DEMOS_TABLE)
-    monkeypatch.setenv("ACTIVITY_TABLE", ACTIVITY_TABLE)
-    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
-    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "testing")
-    monkeypatch.setenv("AWS_DEFAULT_REGION", "us-east-1")
-    monkeypatch.setenv("AWS_REGION", "us-east-1")
     monkeypatch.setenv("MINIMAX_API_KEY", "x")
-    with mock_aws():
-        _create_users_table()
-        _create_demos_table()
-        yield
+    f = FakeCosmos()
+    cosmos.set_container_provider(f)
+    yield f
+    cosmos.reset_container_provider()
 
 
 def _import_app():
@@ -261,7 +216,6 @@ def test_guest_links_default_scenario_ok():
 
 def test_guest_link_create_activity_has_ttl_not_token():
     bot = _import_app()
-    _create_activity_table()
     client = _admin_client(bot)
     r = client.post("/api/admin/guest-links", json={"ttl_minutes": 120, "scenario": "default"})
     assert r.status_code == 200, r.text
@@ -330,8 +284,7 @@ def test_guest_login_rejects_normal_session_token():
 def test_guest_login_emits_activity_row():
     from fastapi.testclient import TestClient
     bot = _import_app()
-    _create_activity_table()
-    client = _admin_client(bot)  # wires app + activity table; reads the audit log
+    client = _admin_client(bot)  # wires app + activity store; reads the audit log
     token, _ = bot._issue_guest_token(60, scenario="default")
     # Redeem on a SEPARATE client: guest-login sets the vb_session cookie, which
     # would otherwise clobber the admin client's cookie and 403 the read below.
@@ -489,11 +442,14 @@ def test_validate_launch_config_nova_sonic_plus_zh_hk_400():
 
 
 def test_validate_launch_config_nova_voice_alias_resolves():
-    """A nova-sonic alias voice resolves through NOVA_SONIC_VOICE_ALIASES."""
+    """Re-pointed (ruling B 2026-11-09): engine nova-sonic left ENGINES and the
+    alias map emptied with the C-3 roster — a former alias id no longer
+    validates."""
+    from fastapi import HTTPException
     bot = _import_app()
-    # 'marie' aliases to 'ambre', which IS in the nova table.
-    clean = bot._validate_launch_config(engine="nova-sonic", voice="marie")
-    assert clean == {"engine": "nova-sonic", "voice": "marie"}
+    with pytest.raises(HTTPException) as ei:
+        bot._validate_launch_config(engine="nova-sonic", voice="marie")
+    assert ei.value.status_code == 400
 
 
 # --- POST /api/admin/guest-links full set ----------------------------------
@@ -501,7 +457,6 @@ def test_validate_launch_config_nova_voice_alias_resolves():
 
 def test_guest_links_full_config_200_and_response_carries_all():
     bot = _import_app()
-    _create_activity_table()
     client = _admin_client(bot)
     r = client.post("/api/admin/guest-links", json={
         "ttl_minutes": 90, "scenario": "default",

@@ -1,7 +1,7 @@
 """HistoryRecorder integration tests.
 
-Uses moto[dynamodb] to mock the table; the real bot.py module is loaded
-with HISTORY_TABLE set to a moto-managed table name.
+Uses FakeCosmos (storage.cosmos provider seam) in place of the old moto
+DynamoDB table; the real bot.py module is loaded with history enabled.
 
 Verifies:
   - finalize() writes a row with ttl, turn_count, summary_status='pending'
@@ -20,42 +20,11 @@ import os
 import sys
 import time
 
-import boto3
 import pytest
 
-# moto v5 mocks all AWS services through a single decorator/context manager.
-from moto import mock_aws
-
-
-TABLE_NAME = "voicebot-test-call-history"
-
-
-def _create_table(region: str = "us-east-1") -> None:
-    ddb = boto3.client("dynamodb", region_name=region)
-    ddb.create_table(
-        TableName=TABLE_NAME,
-        BillingMode="PAY_PER_REQUEST",
-        AttributeDefinitions=[
-            {"AttributeName": "call_id", "AttributeType": "S"},
-            {"AttributeName": "caller", "AttributeType": "S"},
-            {"AttributeName": "started_at", "AttributeType": "N"},
-        ],
-        KeySchema=[{"AttributeName": "call_id", "KeyType": "HASH"}],
-        GlobalSecondaryIndexes=[
-            {
-                "IndexName": "caller-started-index",
-                "KeySchema": [
-                    {"AttributeName": "caller", "KeyType": "HASH"},
-                    {"AttributeName": "started_at", "KeyType": "RANGE"},
-                ],
-                "Projection": {"ProjectionType": "KEYS_ONLY"},
-            }
-        ],
-    )
-    ddb.update_time_to_live(
-        TableName=TABLE_NAME,
-        TimeToLiveSpecification={"Enabled": True, "AttributeName": "ttl"},
-    )
+from fake_cosmos import FakeCosmos
+from storage import cosmos
+from storage.cosmos_calls import CosmosCallRepository
 
 
 def _import_bot_with_env(env: dict) -> object:
@@ -79,30 +48,29 @@ def aws_creds(monkeypatch):
     yield
 
 
-def test_history_disabled_when_table_empty(aws_creds, monkeypatch):
-    monkeypatch.setenv("HISTORY_TABLE", "")
-    bot = _import_bot_with_env({"HISTORY_TABLE": ""})
-    assert bot._history is None
-    assert bot.HISTORY_DISABLED is True
+def test_history_enabled_by_default(aws_creds, monkeypatch):
+    # B10（BC-c1）：HISTORY_TABLE 退役后默认启用，HISTORY_DISABLED=1 才禁用。
+    monkeypatch.delenv("HISTORY_DISABLED", raising=False)
+    bot = _import_bot_with_env({})
+    assert bot._history is not None
+    assert bot.HISTORY_DISABLED is False
 
 
 def test_history_disabled_via_flag(aws_creds, monkeypatch):
-    monkeypatch.setenv("HISTORY_TABLE", "still-set")
     monkeypatch.setenv("HISTORY_DISABLED", "1")
-    bot = _import_bot_with_env({"HISTORY_TABLE": "still-set", "HISTORY_DISABLED": "1"})
+    bot = _import_bot_with_env({"HISTORY_DISABLED": "1"})
     assert bot._history is None
     assert bot.HISTORY_DISABLED is True
 
 
 def test_finalize_writes_pending_then_ok(aws_creds, monkeypatch):
-    monkeypatch.setenv("HISTORY_TABLE", TABLE_NAME)
     monkeypatch.setenv("HISTORY_TTL_DAYS", "7")
     monkeypatch.delenv("HISTORY_DISABLED", raising=False)
 
-    with mock_aws():
-        _create_table()
+    fake = FakeCosmos()
+    cosmos.set_container_provider(fake)
+    try:
         bot = _import_bot_with_env({
-            "HISTORY_TABLE": TABLE_NAME,
             "HISTORY_TTL_DAYS": "7",
         })
         assert bot._history is not None
@@ -129,7 +97,8 @@ def test_finalize_writes_pending_then_ok(aws_creds, monkeypatch):
             "scenario": "default",
             "provider": "polly",
             "voice": "tiffany",
-            "model": "nova-2-lite",
+            # A-4 裁定(a)：model 欄=選擇 key（鏡像運行時寫入 bot.py:6079/:7111），動態防朽
+            "model": bot.DEFAULT_MODEL,
             "minimax_model": "speech-2.8-turbo",
         })
         bot._history.append(call_id, {"who": "user", "text": "hello", "t": 0.5})
@@ -143,9 +112,11 @@ def test_finalize_writes_pending_then_ok(aws_creds, monkeypatch):
 
         asyncio.run(run())
 
-        ddb = boto3.resource("dynamodb", region_name="us-east-1")
-        table = ddb.Table(TABLE_NAME)
-        item = table.get_item(Key={"call_id": call_id}).get("Item")
+        # 读回走独立 repo 实例（等价旧 table.get_item）；_read_row 把 ttl
+        # 曝光为删除点 epoch（§1.3-5 语义 1:1），断言形状不动。
+        item = CosmosCallRepository(ttl_days=30).get_history_doc(call_id)
+    finally:
+        cosmos.reset_container_provider()
 
     assert item is not None, "row not written"
     assert item["call_id"] == call_id
@@ -166,12 +137,12 @@ def test_finalize_writes_pending_then_ok(aws_creds, monkeypatch):
 
 
 def test_finalize_failed_summary_marks_status(aws_creds, monkeypatch):
-    monkeypatch.setenv("HISTORY_TABLE", TABLE_NAME)
     monkeypatch.delenv("HISTORY_DISABLED", raising=False)
 
-    with mock_aws():
-        _create_table()
-        bot = _import_bot_with_env({"HISTORY_TABLE": TABLE_NAME})
+    fake = FakeCosmos()
+    cosmos.set_container_provider(fake)
+    try:
+        bot = _import_bot_with_env({})
 
         async def boom(turns, lang_key, **_):
             raise RuntimeError("bedrock unreachable")
@@ -186,7 +157,8 @@ def test_finalize_failed_summary_marks_status(aws_creds, monkeypatch):
             "scenario": "default",
             "provider": "polly",
             "voice": "tiffany",
-            "model": "nova-2-lite",
+            # A-4 裁定(a)：model 欄=選擇 key（鏡像運行時寫入 bot.py:6079/:7111），動態防朽
+            "model": bot.DEFAULT_MODEL,
             "minimax_model": "",
         })
         bot._history.append(call_id, {"who": "user", "text": "hi", "t": 0.1})
@@ -198,9 +170,9 @@ def test_finalize_failed_summary_marks_status(aws_creds, monkeypatch):
 
         asyncio.run(run())
 
-        ddb = boto3.resource("dynamodb", region_name="us-east-1")
-        table = ddb.Table(TABLE_NAME)
-        item = table.get_item(Key={"call_id": call_id}).get("Item")
+        item = CosmosCallRepository(ttl_days=30).get_history_doc(call_id)
+    finally:
+        cosmos.reset_container_provider()
 
     assert item is not None
     assert item["summary_status"] == "failed"
@@ -209,7 +181,7 @@ def test_finalize_failed_summary_marks_status(aws_creds, monkeypatch):
 
 
 def test_coerce_summary_struct_handles_fenced_json(aws_creds, monkeypatch):
-    bot = _import_bot_with_env({"HISTORY_TABLE": ""})
+    bot = _import_bot_with_env({})
     fenced = '```json\n{"intent":"x","key_questions":["q"],"action_items":[],"sentiment":"neutral"}\n```'
     out = bot._coerce_summary_struct(fenced)
     assert out["intent"] == "x"
@@ -218,7 +190,7 @@ def test_coerce_summary_struct_handles_fenced_json(aws_creds, monkeypatch):
 
 
 def test_coerce_summary_struct_degrades_on_garbage(aws_creds):
-    bot = _import_bot_with_env({"HISTORY_TABLE": ""})
+    bot = _import_bot_with_env({})
     out = bot._coerce_summary_struct("not json at all")
     assert out["intent"].startswith("not json")
     assert out["key_questions"] == []

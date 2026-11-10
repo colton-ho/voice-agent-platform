@@ -18,8 +18,9 @@ What it does
    ``demo_loader.normalize_demo_dict`` helper, so the tool-list key is
    ``tool_ids`` — **never** ``tools``).
 2. For each demo, ``DemoStore.put(demo)`` writes one DDB item.
-   ``put`` re-normalizes through the SAME shared helper and serializes with
-   ``bot._to_ddb`` (float -> Decimal), so the written item's key shape is
+   ``put`` re-normalizes through the SAME shared helper and stores natively
+   (Cosmos JSON; the DDB-era ``bot._to_ddb`` Decimal serialization retired
+   with F-16), so the written item's key shape is
    byte-identical to what ``DemoStore.get`` reads back — ``tool_ids`` and
    all of ``system / greeting / kb_body / kb_intro / kb_ack / mcp_servers /
    filler / tags`` are preserved. We do NOT touch the runtime put/get logic;
@@ -38,7 +39,8 @@ CLI
     python scripts/migrate_demos_to_ddb.py --path /some/data   # custom data root
     python scripts/migrate_demos_to_ddb.py --table my-demos    # custom table name
 
-The target table is ``DEMOS_TABLE`` env (default ``genaiic-voicebot-demos``),
+The target is the Cosmos ``demos`` container (§1.1; B10 retired the
+``DEMOS_TABLE`` table-name env),
 overridable with ``--table``. AWS region follows the same resolution as
 :mod:`demo_store` (``DDB_REGION`` -> ``AWS_REGION`` -> ``us-east-1``).
 
@@ -191,7 +193,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--table",
         default=None,
-        help="DemosTable name (default: DEMOS_TABLE env / genaiic-voicebot-demos).",
+        help="Demos container name (default: Cosmos container 'demos', §1.1 — B10 retired the DEMOS_TABLE env).",
     )
     args = parser.parse_args(argv)
     try:

@@ -225,6 +225,7 @@ async def test_merge_skips_conflicting_end_call_and_roundtrips(
             tool_call_id="call-1",
             arguments={"city": "Tokyo"},
             llm=None,
+            pipeline_worker=None,  # required since pipecat 1.4.0; unused here
             context=None,
             result_callback=result_callback,
         )

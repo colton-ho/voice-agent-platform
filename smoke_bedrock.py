@@ -1,33 +1,33 @@
-"""Smoke test: AWS Bedrock LLM via Pipecat service (one-shot, no pipeline)."""
+"""Smoke test: Azure AI Foundry LLM connectivity via the FC-3 adapter (one-shot).
+
+Rewrote the Bedrock probe (mapping §5 F10): ``BEDROCK_MODEL_ID`` is deleted —
+the target deployment comes from the frozen §11 contract vars (LLM_DEPLOYMENT
+anchor, D-4 zero default), auth is Managed Identity (no keys). Run where Azure
+credentials are available (e.g. ``az login`` or the VM system identity).
+"""
 
 import asyncio
-import os
 
 from dotenv import load_dotenv
-from pipecat.processors.aggregators.llm_context import LLMContext
-from pipecat.services.aws.llm import AWSBedrockLLMService
-from pipecat.services.settings import LLMSettings
+
+from providers.llm.azure_openai import make_managed_llm
 
 
 async def main() -> None:
     load_dotenv()
-    region = os.environ.get("AWS_REGION", "us-east-1")
-    model = os.environ.get("BEDROCK_MODEL_ID", "us.amazon.nova-2-lite-v1:0")
+    llm = make_managed_llm()
 
-    llm = AWSBedrockLLMService(
-        aws_region=region,
-        settings=LLMSettings(
-            model=model,
-            system_instruction="You are a friendly voice assistant. Keep replies to one sentence.",
-            max_tokens=128,
-        ),
+    reply = await llm.complete(
+        messages=[
+            {
+                "role": "system",
+                "content": "You are a friendly voice assistant. Keep replies to one sentence.",
+            },
+            {"role": "user", "content": "Say hi in Chinese in one short sentence."},
+        ],
+        max_tokens=128,
     )
-
-    ctx = LLMContext()
-    ctx.add_message({"role": "user", "content": "Say hi in Chinese in one short sentence."})
-
-    reply = await llm.run_inference(ctx)
-    print(f"\n=== Bedrock ({model}) reply ===\n{reply}\n")
+    print(f"\n=== Foundry ({llm._deployment}) reply ===\n{reply}\n")
 
 
 if __name__ == "__main__":

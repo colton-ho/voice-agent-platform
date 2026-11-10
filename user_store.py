@@ -1,16 +1,18 @@
-"""User store: DynamoDB-backed account table with bcrypt password hashing.
+"""User store: Cosmos-backed account container with bcrypt password hashing.
 
 Backs the JWT-session auth model that replaced the old shared SITE_PASSWORD /
-ADMIN_PASSWORD Basic Auth (see bot.py). Mirrors the DDB usage pattern of
-:class:`HistoryRecorder` (bot.py) — a sync boto3 resource wrapped in
-``asyncio.to_thread`` so it never blocks the event loop, and graceful
-degradation (log + treat as empty) when the table does not exist.
+ADMIN_PASSWORD Basic Auth (see bot.py). Storage goes through the
+``storage.cosmos`` seam (container ``users``, PK /username, id=username —
+pipeline-infra-spec §1.1): async methods wrap the sync container verbs in
+``asyncio.to_thread`` so they never block the event loop, and graceful
+degradation (log + treat as empty) when the container does not exist.
 
-Table shape
------------
-- Table name: env ``USERS_TABLE`` (default ``genaiic-voicebot-users``).
-- Partition key: ``username`` (string).
+Container shape
+---------------
+- Container: ``users`` (§1.1 frozen). Partition key ``username``; id=username
+  (point ops).
 - Item fields:
+    id             str   (= username, Cosmos id)
     username       str
     password_hash  str   (bcrypt, cost 12)
     role           str   ("admin" | "user")
@@ -39,12 +41,10 @@ import os
 import time
 from typing import Any
 
-import boto3
-from botocore.exceptions import ClientError
+from storage import cosmos
+from storage.cosmos import ContainerConflict, ContainerNotFound
 
 logger = logging.getLogger(__name__)
-
-USERS_TABLE = os.environ.get("USERS_TABLE", "genaiic-voicebot-users").strip() or "genaiic-voicebot-users"
 
 VALID_ROLES = ("admin", "user")
 BCRYPT_COST = 12
@@ -104,33 +104,20 @@ def _safe_view(item: dict[str, Any]) -> dict[str, Any]:
 
 
 class UserStore:
-    """DynamoDB-backed user account store.
+    """Cosmos-backed user account store.
 
-    All public methods are async and run the blocking boto3 calls via
-    ``asyncio.to_thread``. The table object is created lazily on first use so
-    constructing a ``UserStore`` never touches AWS (cheap to import).
+    All public methods are async and run the blocking container verbs via
+    ``asyncio.to_thread``. Containers resolve through ``storage.cosmos`` on
+    first use, so constructing a ``UserStore`` never touches Azure (cheap to
+    import). ``table_name`` is retained for signature compatibility (the env
+    name is retired in B-5).
     """
 
     def __init__(self, table_name: str | None = None, region: str | None = None):
-        self._table_name = (table_name or USERS_TABLE)
-        # DynamoDB lives in the deploy region; DDB_REGION falls back to
-        # AWS_REGION so single-region deploys are unchanged.
-        self._region = region or os.environ.get("DDB_REGION") or os.environ.get("AWS_REGION", "us-east-1")
-        self._table = None
+        self._table_name = table_name or cosmos.USERS
 
-    def _get_table(self):
-        if self._table is None:
-            self._table = boto3.resource("dynamodb", region_name=self._region).Table(self._table_name)
-        return self._table
-
-    # ---- internals: classify "table missing" so reads degrade to empty ----
-
-    @staticmethod
-    def _is_missing_table(exc: Exception) -> bool:
-        # botocore ClientError carries response['Error']['Code'].
-        code = getattr(exc, "response", {}).get("Error", {}).get("Code") if hasattr(exc, "response") else None
-        name = type(exc).__name__
-        return code in ("ResourceNotFoundException",) or name == "ResourceNotFoundException"
+    def _users(self):
+        return cosmos.get_container(cosmos.USERS)
 
     # ---- reads -----------------------------------------------------------
 
@@ -143,54 +130,37 @@ class UserStore:
 
     async def _get_raw(self, username: str) -> dict[str, Any] | None:
         """Internal: return the full row INCLUDING password_hash, or None.
-        Table-missing degrades to None (treated as empty)."""
-        table = self._get_table()
-
+        Missing container/row degrades to None (treated as empty)."""
         def _call():
-            return table.get_item(Key={"username": username})
+            return self._users().read_item(item_id=username, partition_key=username)
 
         try:
-            resp = await asyncio.to_thread(_call)
-        except Exception as e:
-            if self._is_missing_table(e):
-                logger.warning(
-                    f"user_store: table {self._table_name!r} missing; treating user "
-                    f"{username!r} as absent"
-                )
-                return None
-            logger.warning(f"user_store: get_item failed for {username!r}: {e}")
+            return await asyncio.to_thread(_call)
+        except ContainerNotFound:
             return None
-        return resp.get("Item")
+        except Exception as e:
+            logger.warning(f"user_store: read failed for {username!r}: {e}")
+            return None
 
     async def list(self) -> list[dict[str, Any]]:
-        """Return safe views of all users. Table-missing degrades to []."""
-        table = self._get_table()
-
+        """Return safe views of all users. Missing container degrades to []."""
         def _call():
-            items: list[dict] = []
-            kwargs: dict[str, Any] = {}
-            while True:
-                resp = table.scan(**kwargs)
-                items.extend(resp.get("Items", []))
-                lek = resp.get("LastEvaluatedKey")
-                if not lek:
-                    break
-                kwargs["ExclusiveStartKey"] = lek
-            return items
+            # users 表只存少量管理帳號（§1.1 point-ops 容器），跨分區全量可接受
+            return self._users().query_items("SELECT * FROM c", [])
 
         try:
             items = await asyncio.to_thread(_call)
+        except ContainerNotFound:
+            logger.warning(
+                f"user_store: container for {self._table_name!r} missing; list() -> []"
+            )
+            return []
+        # Any OTHER error (e.g. AccessDenied, throttling) must NOT be
+        # swallowed as "empty": that would make _needs_setup() wrongly
+        # report needs_setup=true and send an initialized deployment to the
+        # /setup wizard. Re-raise so the caller surfaces a real error.
         except Exception as e:
-            if self._is_missing_table(e):
-                logger.warning(
-                    f"user_store: table {self._table_name!r} missing; list() -> []"
-                )
-                return []
-            # Any OTHER error (e.g. AccessDenied, throttling) must NOT be
-            # swallowed as "empty": that would make _needs_setup() wrongly
-            # report needs_setup=true and send an initialized deployment to the
-            # /setup wizard. Re-raise so the caller surfaces a real error.
-            logger.error(f"user_store: scan failed (re-raising): {e}")
+            logger.error(f"user_store: list failed (re-raising): {e}")
             raise
         users = [_safe_view(it) for it in items]
         users.sort(key=lambda u: (u.get("username") or ""))
@@ -216,30 +186,40 @@ class UserStore:
             raise ValueError(f"user {username!r} already exists")
 
         item = {
+            "id": username,
             "username": username,
             "password_hash": hash_password(password),
             "role": role,
             "created_at": int(time.time()),
             "disabled": False,
         }
-        table = self._get_table()
-        # Conditional put guards against a race where two creates land at once.
-        # On a concurrent collision DynamoDB raises ClientError
-        # (ConditionalCheckFailedException), NOT the ValueError that the
-        # _get_raw pre-check above raises. Normalize it to the SAME
+
+        def _call():
+            return self._users().create_item(item)
+
+        # create_item is the atomic uniqueness guard: on a concurrent collision
+        # it raises ContainerConflict, NOT the ValueError that the _get_raw
+        # pre-check above raises. Normalize it to the SAME
         # ValueError("already exists") so every caller sees uniform semantics
         # whether the dup was caught by the pre-check or lost the write race.
         try:
-            await asyncio.to_thread(
-                lambda: table.put_item(
-                    Item=item, ConditionExpression="attribute_not_exists(username)"
-                )
-            )
-        except ClientError as e:
-            if e.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
-                raise ValueError(f"user {username!r} already exists") from e
-            raise
+            await asyncio.to_thread(_call)
+        except ContainerConflict as e:
+            raise ValueError(f"user {username!r} already exists") from e
         return _safe_view(item)
+
+    async def _patch(self, username: str, ops: list[dict[str, Any]]) -> bool:
+        """Patch one user row (fields only). False iff the row vanished
+        between the caller's existence check and the write."""
+
+        def _call():
+            return self._users().patch_item(username, username, ops)
+
+        try:
+            await asyncio.to_thread(_call)
+            return True
+        except ContainerNotFound:
+            return False
 
     async def set_password(self, username: str, password: str) -> bool:
         """Reset a user's password. Returns False if the user does not exist."""
@@ -248,15 +228,7 @@ class UserStore:
         if await self._get_raw(username) is None:
             return False
         new_hash = hash_password(password)
-        table = self._get_table()
-        await asyncio.to_thread(
-            lambda: table.update_item(
-                Key={"username": username},
-                UpdateExpression="SET password_hash = :h",
-                ExpressionAttributeValues={":h": new_hash},
-            )
-        )
-        return True
+        return await self._patch(username, [{"op": "set", "path": "/password_hash", "value": new_hash}])
 
     async def set_role(self, username: str, role: str) -> bool:
         """Change a user's role. Returns False if the user does not exist."""
@@ -264,47 +236,24 @@ class UserStore:
             raise ValueError(f"invalid role {role!r}: must be one of {list(VALID_ROLES)}")
         if await self._get_raw(username) is None:
             return False
-        table = self._get_table()
-        await asyncio.to_thread(
-            lambda: table.update_item(
-                Key={"username": username},
-                UpdateExpression="SET #r = :r",
-                ExpressionAttributeNames={"#r": "role"},
-                ExpressionAttributeValues={":r": role},
-            )
-        )
-        return True
+        return await self._patch(username, [{"op": "set", "path": "/role", "value": role}])
 
     async def set_disabled(self, username: str, disabled: bool) -> bool:
         """Enable/disable a user. Returns False if the user does not exist."""
         if await self._get_raw(username) is None:
             return False
-        table = self._get_table()
-        await asyncio.to_thread(
-            lambda: table.update_item(
-                Key={"username": username},
-                UpdateExpression="SET disabled = :d",
-                ExpressionAttributeValues={":d": bool(disabled)},
-            )
-        )
-        return True
+        return await self._patch(username, [{"op": "set", "path": "/disabled", "value": bool(disabled)}])
 
     async def delete(self, username: str) -> bool:
         """Delete a user. Returns True if a row was removed."""
-        table = self._get_table()
-
         def _call():
-            return table.delete_item(
-                Key={"username": username}, ReturnValues="ALL_OLD"
-            )
+            return self._users().delete_item(item_id=username, partition_key=username)
 
         try:
-            resp = await asyncio.to_thread(_call)
-        except Exception as e:
-            if self._is_missing_table(e):
-                return False
-            raise
-        return bool(resp.get("Attributes"))
+            await asyncio.to_thread(_call)
+        except ContainerNotFound:
+            return False
+        return True
 
     async def verify(self, username: str, password: str) -> dict[str, Any] | None:
         """Return the safe view of the user iff the password matches AND the

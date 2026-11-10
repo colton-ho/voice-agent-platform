@@ -245,6 +245,9 @@ class _DriverLLMService(LLMService):
                 tool_call_id="call-1",
                 arguments={},
                 llm=self,  # REAL in-pipeline LLMService — push_frame not mocked
+                # pipecat 1.4.0 made pipeline_worker a required field; nothing on
+                # this path touches it (wrapper uses params.llm / result_callback)
+                pipeline_worker=None,
                 context=LLMContext(),
                 result_callback=AsyncMock(),
             )

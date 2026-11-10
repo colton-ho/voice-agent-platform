@@ -1,4 +1,4 @@
-"""Demo store: DynamoDB-backed demo configs preserving DemoLoader's interface.
+"""Demo store: Cosmos-backed demo configs preserving DemoLoader's interface.
 
 Drop-in replacement for :class:`demo_loader.DemoLoader` as the ``DEMO_LOADER``
 singleton in bot.py — the public surface is byte-identical so no call site
@@ -10,33 +10,35 @@ changes:
 
 Two differences from DemoLoader, both additive:
 
-  * ``rescan()`` is **async** (it does a paginated ``table.scan()``), whereas
+  * ``rescan()`` is **async** (it queries the container), whereas
     DemoLoader.rescan is sync. The only caller of DemoStore.rescan is the
     FastAPI ``lifespan`` startup hook, which awaits it. ``get``/``list`` stay
     synchronous and read the in-memory cache, so every per-call site in bot.py
     (which only ever calls ``get``/``list``) is unchanged.
   * ``put(demo_dict)`` is new (DemoLoader had no writer — it scanned disk). It
-    persists one demo as a single DDB item.
+    persists one demo as a single document.
 
-DynamoDB usage mirrors :class:`user_store.UserStore` / ``HistoryRecorder``:
-a sync boto3 resource wrapped in ``asyncio.to_thread`` so it never blocks the
-event loop, and graceful degradation (log + keep prior/empty cache) when the
-table is missing. The ``last_skipped`` attribute records the degrade reason
-for admin diagnostics, paralleling DemoLoader.
+Storage goes through the ``storage.cosmos`` seam (container ``demos``,
+pipeline-infra-spec §1.1): PK /type = constant ``"demo"`` (X3 ruling — a
+single-partition list, the table is small), id=demo_id. Reads/writes wrap the
+sync container verbs in ``asyncio.to_thread`` and degrade gracefully (log +
+keep prior/empty cache) when the container is missing. The ``last_skipped``
+attribute records the degrade reason for admin diagnostics, paralleling
+DemoLoader.
 
-Decimal handling
-----------------
-Writes reuse ``bot._to_ddb`` (float -> Decimal) — we do NOT define a second
-converter. On read, ``_from_ddb`` walks the item and converts every Decimal
-back to int (integral) or float (fractional) so consumers see plain Python
-numbers — e.g. ``filler.probability`` is a float, not a Decimal, before it
-reaches TimeoutFillerObserver.
+Serialization
+-------------
+Cosmos JSON stores plain numbers natively — no Decimal conversion on write
+(the DDB-era ``bot._to_ddb`` converter retired with F-16). On read, ``_from_ddb`` is kept as the
+number-normalizing passthrough (pinned by tests) and ``_deserialize`` strips
+storage-only keys (PK ``type`` + ``_``-prefixed system props) before the
+SHARED normalizer so the cached dict is byte-identical to the manifest path.
 
-Table shape
------------
-- Table name: env ``DEMOS_TABLE`` (default ``genaiic-voicebot-demos``).
-- Partition key: ``id`` (string).
-- Item: the full canonical demo dict (system/greeting/kb_* per-lang maps,
+Container shape
+---------------
+- Container: ``demos`` (§1.1 frozen). Partition key ``type`` (constant
+  ``"demo"``), id = demo id.
+- Document: the full canonical demo dict (system/greeting/kb_* per-lang maps,
   kb_body str|map, tool_ids list, mcp_servers list, filler map, tags list).
 """
 
@@ -48,24 +50,23 @@ import os
 from decimal import Decimal
 from typing import Any
 
-import boto3
-
 from demo_loader import kb_chars_of, normalize_demo_dict
+from storage import cosmos
+from storage.cosmos import ContainerNotFound
 
 logger = logging.getLogger(__name__)
 
-DEMOS_TABLE = (
-    os.environ.get("DEMOS_TABLE", "genaiic-voicebot-demos").strip()
-    or "genaiic-voicebot-demos"
-)
+# X3：demos 容器單分區常量（PK /type）
+DEMO_PARTITION_VALUE = "demo"
 
 
 def _from_ddb(value: Any) -> Any:
     """Recursively convert DynamoDB Decimals back to plain Python numbers.
 
     Integral Decimals -> int, fractional -> float. Lists / dicts are walked;
-    other scalars pass through unchanged. Inverse of ``bot._to_ddb`` for the
-    read path (e.g. ``filler.probability`` comes back as a float)."""
+    other scalars pass through unchanged. Kept as the read-path number
+    normalizer (pinned by tests); Cosmos JSON carries native numbers so this
+    is a passthrough there."""
     if isinstance(value, Decimal):
         # Integral values (e.g. timeout_ms) -> int; fractional -> float.
         return int(value) if value == value.to_integral_value() else float(value)
@@ -77,60 +78,42 @@ def _from_ddb(value: Any) -> Any:
 
 
 class DemoStore:
-    """DynamoDB-backed demo store with the DemoLoader public interface.
+    """Cosmos-backed demo store with the DemoLoader public interface.
 
-    The table object is created lazily on first use so constructing a
-    ``DemoStore`` never touches AWS (cheap to import — bot.py builds the
+    Containers resolve through ``storage.cosmos`` on first use so constructing
+    a ``DemoStore`` never touches Azure (cheap to import — bot.py builds the
     singleton at import time). The cache starts empty; the FastAPI lifespan
     startup hook ``await``s :meth:`rescan` to prewarm it.
     """
 
     def __init__(self, table_name: str | None = None, region: str | None = None):
-        self._table_name = table_name or DEMOS_TABLE
-        # DynamoDB lives in the deploy region; DDB_REGION falls back to
-        # AWS_REGION so single-region deploys are unchanged (matches user_store).
-        self._region = (
-            region
-            or os.environ.get("DDB_REGION")
-            or os.environ.get("AWS_REGION", "us-east-1")
-        )
-        self._table = None
+        self._table_name = table_name or cosmos.DEMOS
         self._cache: dict[str, dict[str, Any]] = {}
         self.last_skipped: list[dict[str, str]] = []
 
-    def _get_table(self):
-        if self._table is None:
-            self._table = boto3.resource(
-                "dynamodb", region_name=self._region
-            ).Table(self._table_name)
-        return self._table
-
-    # ---- internals: classify "table missing" so reads degrade -------------
+    def _demos(self):
+        return cosmos.get_container(cosmos.DEMOS)
 
     @staticmethod
-    def _is_missing_table(exc: Exception) -> bool:
-        # Mirrors user_store.UserStore._is_missing_table.
-        code = (
-            getattr(exc, "response", {}).get("Error", {}).get("Code")
-            if hasattr(exc, "response")
-            else None
-        )
-        name = type(exc).__name__
-        return code == "ResourceNotFoundException" or name == "ResourceNotFoundException"
+    def _is_missing(exc: Exception) -> bool:
+        return isinstance(exc, ContainerNotFound)
 
     # ---- deserialization --------------------------------------------------
 
     @staticmethod
     def _deserialize(item: dict[str, Any]) -> dict[str, Any]:
-        """DDB item -> canonical demo dict (same key shape as DemoLoader.get).
+        """Container document -> canonical demo dict (same key shape as
+        DemoLoader.get).
 
-        Decimal -> float/int first, then through the SHARED normalizer so the
-        ``tool_ids`` key (NOT ``tools``) and all other keys are byte-identical
-        to the manifest path. ``validate_tools=False``: stored ids were already
-        validated when written, and a registry change must not silently drop
-        them on read.
+        Storage-only keys (PK ``type``, ``_``-prefixed system props) are
+        stripped first so they can never leak into the canonical shape; then
+        through the SHARED normalizer so the ``tool_ids`` key (NOT ``tools``)
+        and all other keys are byte-identical to the manifest path.
+        ``validate_tools=False``: stored ids were already validated when
+        written, and a registry change must not silently drop them on read.
         """
-        return normalize_demo_dict(_from_ddb(item), validate_tools=False)
+        clean = {k: v for k, v in item.items() if not k.startswith("_") and k != "type"}
+        return normalize_demo_dict(_from_ddb(clean), validate_tools=False)
 
     # ---- public API (sync reads — same signatures as DemoLoader) ----------
 
@@ -161,35 +144,31 @@ class DemoStore:
     # ---- prewarm / refresh (async) ----------------------------------------
 
     async def rescan(self) -> int:
-        """Paginated ``table.scan()`` -> rebuild the in-memory cache. Returns
-        the number of demos loaded.
+        """Query the ``demos`` container -> rebuild the in-memory cache.
+        Returns the number of demos loaded.
 
-        Table-missing / scan error -> record ``last_skipped`` and DEGRADE: the
-        existing cache (prior contents, or empty at startup) is KEPT, and the
-        previous count is returned. Never raises, so a DDB outage at startup
-        does not block the app (mirrors user_store's degrade philosophy)."""
+        Container-missing / query error -> record ``last_skipped`` and DEGRADE:
+        the existing cache (prior contents, or empty at startup) is KEPT, and
+        the previous count is returned. Never raises, so a storage outage at
+        startup does not block the app (mirrors user_store's degrade
+        philosophy)."""
         self.last_skipped = []
-        table = self._get_table()
 
-        def _scan() -> list[dict[str, Any]]:
-            items: list[dict[str, Any]] = []
-            kwargs: dict[str, Any] = {}
-            while True:
-                resp = table.scan(**kwargs)
-                items.extend(resp.get("Items", []))
-                lek = resp.get("LastEvaluatedKey")
-                if not lek:
-                    break
-                kwargs["ExclusiveStartKey"] = lek
-            return items
+        def _query() -> list[dict[str, Any]]:
+            # X3 單分區：全部 demo 都在 PK 值 "demo" 分區裡
+            return self._demos().query_items(
+                "SELECT * FROM c WHERE c.type = @type",
+                [{"name": "@type", "value": DEMO_PARTITION_VALUE}],
+                partition_key=DEMO_PARTITION_VALUE,
+            )
 
         try:
-            items = await asyncio.to_thread(_scan)
+            items = await asyncio.to_thread(_query)
         except Exception as e:
             reason = (
                 f"table {self._table_name!r} missing"
-                if self._is_missing_table(e)
-                else f"scan failed: {type(e).__name__}: {e}"
+                if self._is_missing(e)
+                else f"query failed: {type(e).__name__}: {e}"
             )
             logger.warning(
                 f"demo_store: {reason}; keeping prior cache "
@@ -229,19 +208,24 @@ class DemoStore:
     # ---- write ------------------------------------------------------------
 
     async def put(self, demo_dict: dict[str, Any]) -> None:
-        """Persist one demo as a single DDB item.
+        """Persist one demo as a single document (upsert).
 
         The dict is normalized through the SHARED helper (guaranteeing the
-        ``tool_ids`` key shape on disk too) and floats are converted to Decimal
-        via ``bot._to_ddb`` — REUSED, not re-implemented. Raises ValueError if
-        the demo has no ``id`` (the partition key). Does NOT refresh the cache;
-        the caller (PATCH endpoint / migration) calls ``rescan`` afterwards."""
+        ``tool_ids`` key shape on disk too); numbers are native JSON (no
+        Decimal conversion — Cosmos serializes plain JSON). Raises ValueError
+        if the demo has no ``id`` (the document id). Does NOT refresh the
+        cache; the caller (PATCH endpoint / migration) calls ``rescan``
+        afterwards."""
         if not isinstance(demo_dict, dict) or not demo_dict.get("id"):
             raise ValueError("demo_dict must be a dict with a non-empty 'id'")
-        # Lazy import to avoid an import cycle (bot imports demo_store).
-        from bot import _to_ddb
 
         canonical = normalize_demo_dict(demo_dict, validate_tools=False)
-        item = _to_ddb(canonical)
-        table = self._get_table()
-        await asyncio.to_thread(lambda: table.put_item(Item=item))
+        item = dict(canonical)
+        # X3 分區鍵常量；显式赋值压过任何同名输入键
+        item["type"] = DEMO_PARTITION_VALUE
+        item["id"] = canonical["id"]
+
+        def _call():
+            return self._demos().upsert_item(item)
+
+        await asyncio.to_thread(_call)

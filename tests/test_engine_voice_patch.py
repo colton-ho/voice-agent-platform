@@ -9,7 +9,9 @@ tests/test_timeout_filler.py — no auth path needed):
 * ``bot._validate_engine_voice_patch`` validation logic: valid pipeline / nova
   combos, 400s for every invalid value, explicit-null clears, empty body → {},
   and the engine-UNSET lenient voice rule. (Nova Sonic supports tools/MCP, so
-  there is no tools→engine constraint — a nova-sonic + tools demo is accepted.)
+  there is no tools→engine constraint.) Nova assertions re-pointed to the
+  post-C-3 state (decision (a), ruling B 2026-11-09): engine nova-sonic is out
+  of ENGINES and the nova voice table is emptied, so nova combos now 400.
 
 The full PATCH integration path lives in tests/test_admin_api.py (skipped
 without bcrypt); these cover the pure validation + normalize logic.
@@ -30,8 +32,11 @@ import bot  # noqa: E402
 
 # Concrete sample voice ids pulled from the live tables (kept here so a table
 # rename surfaces as a test failure rather than silent drift).
-NOVA_VOICE = "tiffany"          # in NOVA_SONIC_VOICES
-NOVA_ALIAS = "marie"            # NOVA_SONIC_VOICE_ALIASES -> "ambre"
+# C-3 (decision (a), ruling B 2026-11-09): NOVA_SONIC_VOICES/ALIASES are
+# emptied and engine nova-sonic left ENGINES — the two nova ids below are kept
+# as pre-C-3 data whose PATCHes must now 400.
+NOVA_VOICE = "tiffany"          # was in NOVA_SONIC_VOICES (now emptied)
+NOVA_ALIAS = "marie"            # was NOVA_SONIC_VOICE_ALIASES -> "ambre" (map emptied)
 MINIMAX_VOICE = "Cantonese_GentleLady"  # exact key in MINIMAX_VOICES
 POLLY_VOICE = "Zhiyu"           # exact (case-sensitive) key in POLLY_VOICES
 
@@ -134,15 +139,21 @@ def test_validate_valid_pipeline_polly_combo():
 
 
 def test_validate_valid_nova_combo():
+    # Re-pointed to the post-C-3 state (ruling B 2026-11-09): engine nova-sonic
+    # is out of ENGINES -> every nova combo 400s at the engine check.
     b = _body(engine="nova-sonic", voice=NOVA_VOICE)
-    clean = _validate(b, {"engine", "voice"})
-    assert clean == {"engine": "nova-sonic", "voice": NOVA_VOICE}
+    with pytest.raises(HTTPException) as ei:
+        _validate(b, {"engine", "voice"})
+    assert ei.value.status_code == 400
 
 
 def test_validate_nova_voice_alias_accepted():
+    # Re-pointed: the alias map is emptied (C-3) and the engine retired, so a
+    # former alias id no longer validates.
     b = _body(engine="nova-sonic", voice=NOVA_ALIAS)
-    clean = _validate(b, {"engine", "voice"})
-    assert clean == {"engine": "nova-sonic", "voice": NOVA_ALIAS}
+    with pytest.raises(HTTPException) as ei:
+        _validate(b, {"engine", "voice"})
+    assert ei.value.status_code == 400
 
 
 # =====================================================================
@@ -172,21 +183,23 @@ def test_validate_invalid_values_raise_400(body, fields, kw):
 
 
 def test_validate_nova_with_tools_accepted():
-    # Regression-direction proof: the false tools→pipeline coupling is gone.
-    # Nova Sonic supports function-calling, so engine=nova-sonic is ACCEPTED
-    # regardless of whether the demo has tools/MCP (previously 400).
+    # Re-pointed (ruling B 2026-11-09): engine nova-sonic 400s regardless of
+    # tools — the tools→engine coupling itself remains absent (see the
+    # pipeline+tools test below for that regression direction).
     b = _body(engine="nova-sonic", voice=NOVA_VOICE)
-    clean = _validate(b, {"engine", "voice"})
-    assert clean["engine"] == "nova-sonic"
-    assert clean["voice"] == NOVA_VOICE
+    with pytest.raises(HTTPException) as ei:
+        _validate(b, {"engine", "voice"})
+    assert ei.value.status_code == 400
 
 
 def test_validate_nova_from_demo_engine_accepted():
-    # engine NOT in this PATCH; demo's current engine is nova-sonic; a voice-only
-    # PATCH is still accepted — no tools-based rejection exists anymore.
+    # Re-pointed: engine NOT in this PATCH; demo's current engine is
+    # nova-sonic -> voice validated against the (C-3 emptied) nova table ->
+    # no id resolves -> 400.
     b = _body(voice=NOVA_VOICE)
-    clean = _validate(b, {"voice"}, demo_engine="nova-sonic")
-    assert clean["voice"] == NOVA_VOICE
+    with pytest.raises(HTTPException) as ei:
+        _validate(b, {"voice"}, demo_engine="nova-sonic")
+    assert ei.value.status_code == 400
 
 
 def test_validate_pipeline_with_tools_ok():
@@ -207,10 +220,13 @@ def test_validate_explicit_null_clears_each_field():
 
 
 def test_validate_null_voice_clear_does_not_validate_against_engine():
-    # voice=None is a clear and must NOT be rejected even with engine=nova-sonic.
-    b = _body(engine="nova-sonic", voice=None)
-    clean = _validate(b, {"engine", "voice"})
-    assert clean == {"engine": "nova-sonic", "voice": None}
+    # voice=None is a clear and must NOT be rejected even against a nova-sonic
+    # engine. Re-pointed data (ruling B 2026-11-09): the engine now lives on
+    # the demo (a body engine=nova-sonic itself 400s post-C-3), preserving the
+    # pinned rule that a clear is never validated against the effective engine.
+    b = _body(voice=None)
+    clean = _validate(b, {"voice"}, demo_engine="nova-sonic")
+    assert clean == {"voice": None}
 
 
 # =====================================================================
@@ -218,19 +234,23 @@ def test_validate_null_voice_clear_does_not_validate_against_engine():
 # =====================================================================
 
 def test_validate_voice_uses_demo_engine_when_body_omits_engine():
-    # body sets only voice; demo's current engine is nova-sonic → voice
-    # validated against the nova table.
-    b = _body(voice=NOVA_VOICE)
-    clean = _validate(b, {"voice"}, demo_engine="nova-sonic")
-    assert clean == {"voice": NOVA_VOICE}
-    # a pipeline-only voice would be rejected under demo_engine=nova-sonic.
+    # body sets only voice; demo's current engine/provider govern the table the
+    # voice is validated against. Re-pointed data (ruling B 2026-11-09) to the
+    # selectable pipeline engine — the demo-engine-governs rule is unchanged.
+    b = _body(voice=MINIMAX_VOICE)
+    clean = _validate(b, {"voice"}, demo_engine="pipeline", demo_provider="minimax")
+    assert clean == {"voice": MINIMAX_VOICE}
+    # a polly voice would be rejected under demo_engine=pipeline + provider=minimax.
     with pytest.raises(HTTPException):
-        _validate(_body(voice=MINIMAX_VOICE), {"voice"}, demo_engine="nova-sonic")
+        _validate(_body(voice=POLLY_VOICE), {"voice"},
+                  demo_engine="pipeline", demo_provider="minimax")
 
 
 def test_validate_voice_uses_body_engine_over_demo_engine():
     # body sets engine=nova-sonic AND a pipeline voice → effective engine is
-    # nova (body wins), so the pipeline voice is rejected.
+    # nova (body wins), so the pipeline voice is rejected. (Post-C-3 the 400
+    # fires even earlier — engine nova-sonic is out of ENGINES — but the
+    # body-wins merge rule it pins is unchanged.)
     b = _body(engine="nova-sonic", voice=MINIMAX_VOICE)
     with pytest.raises(HTTPException):
         _validate(b, {"engine", "voice"}, demo_engine="pipeline")
@@ -239,9 +259,12 @@ def test_validate_voice_uses_body_engine_over_demo_engine():
 def test_validate_engine_unset_lenient_accepts_nova_or_pipeline_voice():
     # Neither body nor demo sets engine → lenient: accept a voice that resolves
     # in EITHER table (real engine decided at launch). Reviewer note #3.
-    assert _validate(_body(voice=NOVA_VOICE), {"voice"}) == {"voice": NOVA_VOICE}
     assert _validate(_body(voice=MINIMAX_VOICE), {"voice"}) == {"voice": MINIMAX_VOICE}
     assert _validate(_body(voice=POLLY_VOICE), {"voice"}) == {"voice": POLLY_VOICE}
+    # Re-pointed (ruling B 2026-11-09): the C-3 emptied nova table resolves no
+    # id, so a former nova voice no longer passes the lenient either-table rule.
+    with pytest.raises(HTTPException):
+        _validate(_body(voice=NOVA_VOICE), {"voice"})
 
 
 def test_validate_engine_unset_rejects_voice_in_no_table():

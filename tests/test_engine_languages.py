@@ -2,7 +2,9 @@
 
 Covers the per-engine LANGUAGES model added to bot.py:
 - ``_languages_for_engine`` partitions languages correctly per engine.
-- New Nova-only languages exist with ``stt=None`` + ``engines=["nova-sonic"]``.
+- Nova-only languages exist with ``stt=None``; post-C-3 (decision (a), ruling B
+  2026-11-09) they carry ``engines=[]`` — Voice-Live-gated out of every engine
+  (assertions below re-pointed accordingly).
 - Both options payloads (``_admin_options_payload`` and ``/api/config``)
   expose ``engines`` on each ``languages`` item.
 - ``_validate_segment`` enforces engine↔lang compatibility on the MERGED
@@ -11,8 +13,8 @@ Covers the per-engine LANGUAGES model added to bot.py:
 - Zero regression: the original 5 languages remain valid under ``pipeline``.
 
 These import ``bot.py`` directly (no DB / WS / Bedrock) for the unit checks,
-and use a TestClient with a moto-mocked users table for the end-to-end PUT
-validation, mirroring tests/test_admin_api.py.
+and use a TestClient with the fake Cosmos users container for the end-to-end
+PUT validation, mirroring tests/test_admin_api.py.
 """
 
 from __future__ import annotations
@@ -20,12 +22,13 @@ from __future__ import annotations
 import importlib
 import sys
 
-import boto3
 import pytest
 from fastapi import HTTPException
-from moto import mock_aws
 
-USERS_TABLE = "voicebot-test-engine-langs-users"
+from fake_cosmos import FakeCosmos
+from storage import cosmos
+
+
 _ADMIN_PWD = "test-pwd"
 
 # Languages the design says Nova Sonic supports (and only Nova).
@@ -37,14 +40,12 @@ ORIGINAL_PIPELINE_LANGS = ["zh-HK", "zh-CN", "en-US", "ja-JP", "en-SG"]
 def _common_env(monkeypatch):
     monkeypatch.setenv("ADMIN_PASSWORD", _ADMIN_PWD)
     monkeypatch.setenv("AUTH_SECRET", "test-secret")
-    monkeypatch.setenv("USERS_TABLE", USERS_TABLE)
-    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
-    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "testing")
-    monkeypatch.setenv("AWS_DEFAULT_REGION", "us-east-1")
-    monkeypatch.setenv("AWS_REGION", "us-east-1")
     monkeypatch.setenv("MINIMAX_API_KEY", "x")
     monkeypatch.setenv("SITE_PASSWORD", "")
-    yield
+    f = FakeCosmos()
+    cosmos.set_container_provider(f)
+    yield f
+    cosmos.reset_container_provider()
 
 
 def _import_bot():
@@ -77,7 +78,9 @@ def test_nova_only_langs_present_with_none_stt():
     for k in NOVA_ONLY_LANGS:
         assert k in L, f"missing nova-only lang {k}"
         assert L[k]["stt"] is None, f"{k} should have stt=None"
-        assert L[k]["engines"] == ["nova-sonic"], k
+        # Re-pointed (ruling B 2026-11-09): engines=[] gates them out of every
+        # engine until Azure Voice Live claims them.
+        assert L[k]["engines"] == [], k
         # in-language label/prompt/greeting must be present and non-empty
         assert L[k]["label"]
         assert L[k]["prompt"]
@@ -87,16 +90,19 @@ def test_nova_only_langs_present_with_none_stt():
 def test_languages_for_engine_nova():
     bot = _import_bot()
     nova = bot._languages_for_engine("nova-sonic")
-    # contains en-US (dual) + all nova-only langs
+    # en-US keeps its historical dual engines list (untouched per A-3); the 8
+    # Nova-only langs are gated to engines=[] -> excluded (ruling B 2026-11-09).
     assert "en-US" in nova
     for k in NOVA_ONLY_LANGS:
-        assert k in nova
+        assert k not in nova
     # does NOT contain pipeline-only langs
     for k in ("zh-HK", "zh-CN", "ja-JP", "en-SG"):
         assert k not in nova
-    # exactly matches the set of locales Nova voices cover
+    # C-3 re-point: the built-in Nova roster is emptied, so the old
+    # "engine langs == nova voice locales" invariant becomes the empty table.
+    assert bot.NOVA_SONIC_VOICES == {}
     nova_voice_locales = {v["locale"] for v in bot.NOVA_SONIC_VOICES.values()}
-    assert set(nova) == nova_voice_locales
+    assert nova_voice_locales == set()
 
 
 def test_languages_for_engine_pipeline():
@@ -131,10 +137,12 @@ def test_validate_rejects_pipeline_with_nova_only_lang():
 
 def test_validate_accepts_valid_combos():
     bot = _import_bot()
-    # both should NOT raise
+    # should NOT raise
     bot._validate_segment({"engine": "pipeline", "lang": "zh-HK"})
-    bot._validate_segment({"engine": "nova-sonic", "lang": "en-US"})
-    bot._validate_segment({"engine": "nova-sonic", "lang": "fr-FR"})
+    # Re-pointed (ruling B 2026-11-09): engine nova-sonic left ENGINES, so
+    # every nova combo is rejected at the engine check.
+    _raises_400(lambda: bot._validate_segment({"engine": "nova-sonic", "lang": "en-US"}))
+    _raises_400(lambda: bot._validate_segment({"engine": "nova-sonic", "lang": "fr-FR"}))
 
 
 def test_validate_original_five_under_pipeline_all_valid():
@@ -145,13 +153,15 @@ def test_validate_original_five_under_pipeline_all_valid():
 
 
 def test_validate_partial_update_lang_only_uses_stored_engine():
-    """Only `lang` changes; stored engine is nova-sonic. Switching to a
-    pipeline-only lang (zh-CN) must be rejected based on the MERGED state."""
+    """Only `lang` changes; stored engine drives the MERGED-state cross-check.
+    Re-pointed data (ruling B 2026-11-09) to the selectable engine: switching
+    to a Nova-only lang (fr-FR, engines=[]) must be rejected based on the
+    MERGED state."""
     bot = _import_bot()
-    current = {"engine": "nova-sonic", "lang": "en-US"}
-    _raises_400(lambda: bot._validate_segment({"lang": "zh-CN"}, current))
-    # ...and a nova-compatible lang switch passes
-    bot._validate_segment({"lang": "fr-FR"}, current)
+    current = {"engine": "pipeline", "lang": "en-US"}
+    _raises_400(lambda: bot._validate_segment({"lang": "fr-FR"}, current))
+    # ...and a pipeline-compatible lang switch passes
+    bot._validate_segment({"lang": "zh-CN"}, current)
 
 
 def test_validate_partial_update_engine_only_uses_stored_lang():
@@ -180,7 +190,8 @@ def test_admin_options_payload_has_engines_on_languages():
     assert set(langs["en-US"]["engines"]) == {"pipeline", "nova-sonic"}
     assert langs["zh-HK"]["engines"] == ["pipeline"]
     for k in NOVA_ONLY_LANGS:
-        assert langs[k]["engines"] == ["nova-sonic"]
+        # Re-pointed (ruling B 2026-11-09): Voice-Live-gated -> engines=[]
+        assert langs[k]["engines"] == []
 
 
 def test_admin_options_payload_exposes_default_nova_sonic_voice():
@@ -191,25 +202,16 @@ def test_admin_options_payload_exposes_default_nova_sonic_voice():
     bot = _import_bot()
     payload = bot._admin_options_payload()
     assert payload["default_nova_sonic_voice"] == bot.DEFAULT_NOVA_SONIC_VOICE
-    # And it must be a real nova voice id (so the frontend normalize lands on a
-    # valid selectable option).
-    assert payload["default_nova_sonic_voice"] in bot.NOVA_SONIC_VOICES
+    # Re-pointed 默認值一致性 (ruling B 2026-11-09): C-3 empties the roster and
+    # invalidates the default — the key survives (shape frozen) with content
+    # consistent with the empty table (nothing resolves to a ghost id).
+    assert payload["default_nova_sonic_voice"] == ""
+    assert payload["default_nova_sonic_voice"] not in bot.NOVA_SONIC_VOICES
 
 
 # --------------------------------------------------------------------------
 # End-to-end: /api/config + PUT validation via TestClient
 # --------------------------------------------------------------------------
-
-def _create_users_table(region: str = "us-east-1") -> None:
-    ddb = boto3.client("dynamodb", region_name=region)
-    ddb.create_table(
-        TableName=USERS_TABLE,
-        BillingMode="PAY_PER_REQUEST",
-        AttributeDefinitions=[{"AttributeName": "username", "AttributeType": "S"}],
-        KeySchema=[{"AttributeName": "username", "KeyType": "HASH"}],
-    )
-    ddb.get_waiter("table_exists").wait(TableName=USERS_TABLE)
-
 
 def _admin_client(bot):
     # ADMIN_PASSWORD first-boot seed removed: create the bootstrap admin
@@ -225,9 +227,10 @@ def _admin_client(bot):
 
 
 def _isolate_runtime(bot, tmp_path):
-    """Repoint bot.RUNTIME_CONFIG at a temp-file-backed instance so PUTs in
-    these tests don't mutate the repo's config/runtime.json (bot.py hardcodes
-    that path and ignores RUNTIME_CFG_PATH_OVERRIDE)."""
+    """Belt-and-braces: repoint bot.RUNTIME_CONFIG at a temp-file-backed
+    instance so PUTs in these tests don't mutate the repo's config/runtime.json.
+    (Since the R-C-003 seam bot.py honors RUNTIME_CFG_PATH_OVERRIDE — set by
+    each test below — so this re-point is redundant but kept defensive.)"""
     import runtime_config as rc
     bot.RUNTIME_CONFIG = rc.RuntimeConfig(
         path=str(tmp_path / "runtime.json"),
@@ -237,48 +240,45 @@ def _isolate_runtime(bot, tmp_path):
 
 def test_api_config_languages_have_engines(tmp_path, monkeypatch):
     monkeypatch.setenv("RUNTIME_CFG_PATH_OVERRIDE", str(tmp_path / "runtime.json"))
-    with mock_aws():
-        _create_users_table()
-        bot = _import_bot()
-        _isolate_runtime(bot, tmp_path)
-        client = _admin_client(bot)
-        r = client.get("/api/config")
-        assert r.status_code == 200, r.text
-        langs = {l["id"]: l for l in r.json()["languages"]}
-        assert set(langs["en-US"]["engines"]) == {"pipeline", "nova-sonic"}
-        assert langs["fr-FR"]["engines"] == ["nova-sonic"]
+    bot = _import_bot()
+    _isolate_runtime(bot, tmp_path)
+    client = _admin_client(bot)
+    r = client.get("/api/config")
+    assert r.status_code == 200, r.text
+    langs = {l["id"]: l for l in r.json()["languages"]}
+    assert set(langs["en-US"]["engines"]) == {"pipeline", "nova-sonic"}
+    # Re-pointed (ruling B 2026-11-09): Voice-Live-gated -> engines=[]
+    assert langs["fr-FR"]["engines"] == []
 
 
 def test_put_web_rejects_incompatible_engine_lang(tmp_path, monkeypatch):
     monkeypatch.setenv("RUNTIME_CFG_PATH_OVERRIDE", str(tmp_path / "runtime.json"))
-    with mock_aws():
-        _create_users_table()
-        bot = _import_bot()
-        _isolate_runtime(bot, tmp_path)
-        client = _admin_client(bot)
-        # Establish a known nova-sonic baseline (don't rely on on-disk default).
-        r = client.put("/api/admin/config/web", json={"engine": "nova-sonic", "lang": "en-US"})
-        assert r.status_code == 200, r.text
-        # Partial update: change ONLY lang to a pipeline-only lang. Stored engine
-        # stays nova-sonic; merged state (nova-sonic + zh-HK) is incompatible -> 400.
-        r = client.put("/api/admin/config/web", json={"lang": "zh-HK"})
-        assert r.status_code == 400, r.text
+    bot = _import_bot()
+    _isolate_runtime(bot, tmp_path)
+    client = _admin_client(bot)
+    # Establish a known pipeline baseline (don't rely on on-disk default).
+    # Re-pointed data (ruling B 2026-11-09): nova-sonic left ENGINES.
+    r = client.put("/api/admin/config/web", json={"engine": "pipeline", "lang": "en-US"})
+    assert r.status_code == 200, r.text
+    # Partial update: change ONLY lang to a Nova-only lang. Stored engine
+    # stays pipeline; merged state (pipeline + fr-FR) is incompatible -> 400.
+    r = client.put("/api/admin/config/web", json={"lang": "fr-FR"})
+    assert r.status_code == 400, r.text
 
-        # full valid switch to pipeline+zh-HK passes
-        r = client.put("/api/admin/config/web", json={"engine": "pipeline", "lang": "zh-HK"})
-        assert r.status_code == 200, r.text
+    # full valid switch to pipeline+zh-HK passes
+    r = client.put("/api/admin/config/web", json={"engine": "pipeline", "lang": "zh-HK"})
+    assert r.status_code == 200, r.text
 
 
 def test_put_phone_rejects_pipeline_with_nova_only_lang(tmp_path, monkeypatch):
     monkeypatch.setenv("RUNTIME_CFG_PATH_OVERRIDE", str(tmp_path / "runtime.json"))
-    with mock_aws():
-        _create_users_table()
-        bot = _import_bot()
-        _isolate_runtime(bot, tmp_path)
-        client = _admin_client(bot)
-        # pipeline + fr-FR (stt None) -> 400
-        r = client.put("/api/admin/config/phone", json={"engine": "pipeline", "lang": "fr-FR"})
-        assert r.status_code == 400, r.text
-        # nova-sonic + fr-FR is fine
-        r = client.put("/api/admin/config/phone", json={"engine": "nova-sonic", "lang": "fr-FR"})
-        assert r.status_code == 200, r.text
+    bot = _import_bot()
+    _isolate_runtime(bot, tmp_path)
+    client = _admin_client(bot)
+    # pipeline + fr-FR (stt None) -> 400
+    r = client.put("/api/admin/config/phone", json={"engine": "pipeline", "lang": "fr-FR"})
+    assert r.status_code == 400, r.text
+    # Re-pointed (ruling B 2026-11-09): nova-sonic + fr-FR is also rejected
+    # — engine nova-sonic left ENGINES (was accepted pre-C-3).
+    r = client.put("/api/admin/config/phone", json={"engine": "nova-sonic", "lang": "fr-FR"})
+    assert r.status_code == 400, r.text

@@ -1,20 +1,21 @@
 """Tests for scripts/migrate_demos_to_ddb.py (T4) — one-shot idempotent
-migration of disk demos (data/) into the DynamoDB DemosTable via DemoStore.
+migration of disk demos (data/) into the demos container via DemoStore.
 
 Coverage:
-  - Full migration of a sample data dir -> DemosTable items match
+  - Full migration of a sample data dir -> stored demos match
     DemoLoader.get output INCLUDING the ``tool_ids`` key (NOT ``tools``) and
     system / greeting / kb_body / kb_intro / kb_ack / mcp_servers / filler /
     tags.
   - Idempotency: a second run skips ids already present (no duplicate insert,
     no mutation).
   - ``--overwrite`` (overwrite=True) force-refreshes an existing id.
-  - moto unavailable -> fall back to the pure "demo dict -> ddb item"
-    conversion (demo_loader.normalize_demo_dict + bot._to_ddb) asserting the
-    ``tool_ids`` key is preserved.
+  - Storage-free fallback: the pure "demo dict -> item" conversion
+    (demo_loader.normalize_demo_dict — the DDB-era ``bot._to_ddb`` step retired
+    with F-16, Cosmos JSON stores natively) asserting the ``tool_ids`` key is
+    preserved.
 
-DynamoDB is mocked with moto (mock_aws). The pure-conversion fallback runs
-standalone (no live table) so this file is meaningful even without moto.
+Storage is the in-memory Cosmos fake (tests/fake_cosmos.py) injected through
+the storage.cosmos provider seam. The pure-conversion test runs standalone.
 """
 
 from __future__ import annotations
@@ -24,14 +25,10 @@ import os
 import sys
 import textwrap
 
-import boto3
 import pytest
 
-try:
-    from moto import mock_aws
-    _HAVE_MOTO = True
-except Exception:  # pragma: no cover — env without moto
-    _HAVE_MOTO = False
+from fake_cosmos import FakeCosmos
+from storage import cosmos
 
 # Make the project root + scripts importable regardless of cwd.
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -114,24 +111,11 @@ def sample_data_root(tmp_path):
 
 
 @pytest.fixture
-def ddb_env(monkeypatch):
-    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
-    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "testing")
-    monkeypatch.setenv("AWS_DEFAULT_REGION", "us-east-1")
-    monkeypatch.setenv("AWS_REGION", "us-east-1")
-    monkeypatch.setenv("DEMOS_TABLE", DEMOS_TABLE)
-    yield
-
-
-def _create_demos_table(region: str = "us-east-1") -> None:
-    ddb = boto3.client("dynamodb", region_name=region)
-    ddb.create_table(
-        TableName=DEMOS_TABLE,
-        BillingMode="PAY_PER_REQUEST",
-        AttributeDefinitions=[{"AttributeName": "id", "AttributeType": "S"}],
-        KeySchema=[{"AttributeName": "id", "KeyType": "HASH"}],
-    )
-    ddb.get_waiter("table_exists").wait(TableName=DEMOS_TABLE)
+def fake(monkeypatch):
+    f = FakeCosmos()
+    cosmos.set_container_provider(f)
+    yield f
+    cosmos.reset_container_provider()
 
 
 CANONICAL_KEYS = {
@@ -146,10 +130,10 @@ CANONICAL_KEYS = {
 # ---------------------------------------------------------------------------
 
 def test_pure_demo_dict_to_ddb_item_preserves_tool_ids():
-    """The demo dict -> ddb item path (normalize_demo_dict + bot._to_ddb) keeps
-    the ``tool_ids`` key (never ``tools``)."""
-    from bot import _to_ddb
-
+    """The demo dict -> stored item path keeps the ``tool_ids`` key (never
+    ``tools``). 名保留（名不动值重指）：原 DDB 序列化步 bot._to_ddb 已隨 F-16
+    死碼退役（Cosmos JSON 原生存儲，canonical 即存儲形）——本釘收斂到共享
+    normalizer 的鍵形保全。"""
     raw = {
         "id": "alpha",
         "label": "Alpha",
@@ -161,22 +145,17 @@ def test_pure_demo_dict_to_ddb_item_preserves_tool_ids():
     assert "tool_ids" in canonical and "tools" not in canonical
     assert canonical["tool_ids"] == ["end_call"]
 
-    item = _to_ddb(canonical)
-    assert "tool_ids" in item and "tools" not in item
-    assert item["tool_ids"] == ["end_call"]
-
 
 # ---------------------------------------------------------------------------
-# Full migration round-trip (requires moto table).
+# Full migration round-trip (requires the fake container).
 # ---------------------------------------------------------------------------
 
-@pytest.mark.skipif(not _HAVE_MOTO, reason="moto unavailable")
-def test_migrate_writes_all_fields_matching_loader(ddb_env, sample_data_root):
-    """Migrate sample data/ -> DemosTable items match DemoLoader.get output,
+def test_migrate_writes_all_fields_matching_loader(fake, sample_data_root):
+    """Migrate sample data/ -> stored demos match DemoLoader.get output,
     including tool_ids + system/greeting/kb_body/kb_intro/kb_ack/mcp_servers/
     filler/tags."""
     async def run():
-        store = DemoStore(table_name=DEMOS_TABLE)
+        store = DemoStore()
         summary = await migrate_demos_to_ddb.migrate(
             data_root=sample_data_root, store=store, overwrite=False
         )
@@ -217,16 +196,13 @@ def test_migrate_writes_all_fields_matching_loader(ddb_env, sample_data_root):
         assert isinstance(alpha["filler"]["probability"], float)
         assert alpha["filler"]["timeout_ms"] == 1200
 
-    with mock_aws():
-        _create_demos_table()
-        asyncio.run(run())
+    asyncio.run(run())
 
 
-@pytest.mark.skipif(not _HAVE_MOTO, reason="moto unavailable")
-def test_migrate_is_idempotent_skips_existing(ddb_env, sample_data_root):
-    """A second run skips ids already in the table — no duplicate insert."""
+def test_migrate_is_idempotent_skips_existing(fake, sample_data_root):
+    """A second run skips ids already in the container — no duplicate insert."""
     async def run():
-        store = DemoStore(table_name=DEMOS_TABLE)
+        store = DemoStore()
         first = await migrate_demos_to_ddb.migrate(
             data_root=sample_data_root, store=store, overwrite=False
         )
@@ -240,22 +216,17 @@ def test_migrate_is_idempotent_skips_existing(ddb_env, sample_data_root):
         assert sorted(s["id"] for s in second["skipped"]) == ["alpha", "beta"]
         assert all(s["reason"] == "exists" for s in second["skipped"])
 
-        # Table still has exactly 2 items (no dup rows under same key).
-        ddb = boto3.client("dynamodb", region_name="us-east-1")
-        scanned = ddb.scan(TableName=DEMOS_TABLE)
-        assert scanned["Count"] == 2
+        # Container still has exactly 2 items (no dup rows under same key).
+        assert len(fake.container("demos").docs) == 2
 
-    with mock_aws():
-        _create_demos_table()
-        asyncio.run(run())
+    asyncio.run(run())
 
 
-@pytest.mark.skipif(not _HAVE_MOTO, reason="moto unavailable")
-def test_migrate_overwrite_refreshes_existing(ddb_env, sample_data_root):
+def test_migrate_overwrite_refreshes_existing(fake, sample_data_root):
     """--overwrite (overwrite=True) force-replaces an existing id with the
     current disk content."""
     async def run():
-        store = DemoStore(table_name=DEMOS_TABLE)
+        store = DemoStore()
         await migrate_demos_to_ddb.migrate(
             data_root=sample_data_root, store=store, overwrite=False
         )
@@ -281,22 +252,15 @@ def test_migrate_overwrite_refreshes_existing(ddb_env, sample_data_root):
         await store.rescan()
         assert store.get("alpha")["label"] == "Alpha Demo"
         # Still exactly 2 items.
-        ddb = boto3.client("dynamodb", region_name="us-east-1")
-        assert ddb.scan(TableName=DEMOS_TABLE)["Count"] == 2
+        assert len(fake.container("demos").docs) == 2
 
-    with mock_aws():
-        _create_demos_table()
-        asyncio.run(run())
+    asyncio.run(run())
 
 
-@pytest.mark.skipif(not _HAVE_MOTO, reason="moto unavailable")
-def test_main_cli_entrypoint_runs(ddb_env, sample_data_root):
+def test_main_cli_entrypoint_runs(fake, sample_data_root):
     """The argparse main() runs end-to-end against a sample dir and exits 0."""
-    with mock_aws():
-        _create_demos_table()
-        rc = migrate_demos_to_ddb.main(
-            ["--path", sample_data_root, "--table", DEMOS_TABLE]
-        )
-        assert rc == 0
-        ddb = boto3.client("dynamodb", region_name="us-east-1")
-        assert ddb.scan(TableName=DEMOS_TABLE)["Count"] == 2
+    rc = migrate_demos_to_ddb.main(
+        ["--path", sample_data_root, "--table", DEMOS_TABLE]
+    )
+    assert rc == 0
+    assert len(fake.container("demos").docs) == 2
