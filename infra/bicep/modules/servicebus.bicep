@@ -27,13 +27,17 @@ resource postcallQueue 'Microsoft.ServiceBus/namespaces/queues@2021-11-01' = {
   properties: {
     // §2.1 六值显式：过期消息不残留到月底；过期进 DLQ 可观测而非静默丢弃
     defaultMessageTimeToLive: 'P7D'
-    enableDeadLetteringOnMessageExpiration: true
+    // [U-401 修复·已追认 2026-11-10 team-lead] 原名 enableDeadLetteringOnMessageExpiration 非 ARM 属性
+    //（BCP037）——部署会被拒或静默丢值，V6 六值核对必挂。按 §2.1 语义改正确属性名。
+    deadLetteringOnMessageExpiration: true
     // lock > worker 单次处理节奏（30s 总结超时 + 写回）
     lockDuration: 'PT1M'
     // 重试上限，超限自动死信（消费侧 I-4：最后一次投递必落 failed 终态）
     maxDeliveryCount: 5
-    // 冪等在消费侧按 job_id（§2.2）——broker 去重窗口语义不可靠，不叠加
-    enableDuplicateDetection: false
+    // 冪等在消费侧按 job_id（§2.2）——broker 去重窗口语义不可靠，不叠加。
+    // [U-401 修复·已追认 2026-11-10 team-lead] 原名 enableDuplicateDetection 非队列属性（BCP089），
+    // 正确属性=requiresDuplicateDetection；false=不启用 broker 去重，语义不变。
+    requiresDuplicateDetection: false
     // DLQ 是内建 $DeadLetterQueue，无需单独资源（U-406 清扫属 Phase E）
   }
 }
