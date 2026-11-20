@@ -16,6 +16,14 @@ venv
 **/__pycache__
 *.pyc
 
+# Node artifacts. `static/admin/node_modules` is ~200M after `npm ci` and the
+# image rebuilds it inside a dedicated stage; `dist` is gitignored generated
+# output that the spa stage produces, so sending local copies would make the
+# image depend on whatever happens to be on the developer's disk. Both are
+# excluded here so the Dockerfile's stage 1 is the ONLY source of those bytes.
+**/node_modules
+static/admin/dist
+
 # Vendored ./pipecat — 1.1.x-era reference source tree. MUST NEVER be copied:
 # `import pipecat` from /app would shadow the pip-installed pipecat-ai 1.4.0
 # (same rule as deploy/deploy.sh:70 excluding it from the deploy tarball).

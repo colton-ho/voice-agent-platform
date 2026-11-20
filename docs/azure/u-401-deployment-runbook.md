@@ -136,9 +136,11 @@ network.bicep 只建托管证书 + 域名绑定（无 VNet/私有端点——D2 
 ```bash
 az acr build --registry acrvinebot<env> --image voicebot:<tag> .   # 或 az acr login + docker push
 ```
+> **镜像内含管理后台（多阶段构建）**：`static/admin/dist` 是 gitignore 的 Vite 产物、不在仓库里，所以 `Dockerfile` 第 1 段用 `node:22-alpine` 跑 `npm ci && npm run build` 现编，第 2 段只拷 `dist/`。**ACR 上远程构建即可，本机不需要装 Node**；若 vite 没吐出 `index.html`，构建会直接失败（`test -f dist/index.html`），不会静默产出一个 `/` 返回 404 的容器。这也是为什么本地仓库看不到 `dist/` 属正常。
+
 `containerImage` 回填 `acrvinebot<env>.azurecr.io/voicebot:<tag>` → 重跑 `--apply`。
-- 首布用的是占位公共映像（步骤 4），**这一步才是本服务第一次真正跑起来**：确认 revision 拉取成功、`/api/auth/setup-status` 返回 200、日志无 `SPEECH_KEY`/`AUTH_SECRET` 缺值 fail-fast。
-- 若镜像构建失败：先本地 `az acr build` 看完整报错（`pip install -r requirements.txt -c requirements.lock` 是首次验证点，见 `Dockerfile` 头注释）。
+- 首布用的是占位公共映像（步骤 4），**这一步才是本服务第一次真正跑起来**：确认 revision 拉取成功、`/api/auth/setup-status` 返回 200、`/` 返回管理后台登录页（不是 404）、日志无 `SPEECH_KEY`/`AUTH_SECRET` 缺值 fail-fast。
+- 若镜像构建失败：先本地 `az acr build` 看完整报错（两个首次验证点，见 `Dockerfile` 头注释：`pip install -r requirements.txt -c requirements.lock` 的依赖层，以及第 1 段的 `npm ci`）。
 - control 与 runtime **共用同一映像**（D3：`bot.py` 单进程承 control+media；`includeControlApp=false`，
   进程拆分属代码侧后续项，不属 U-401）。
 - worker 入口：`python workers/postcall_worker.py`（`workerCommand`）。

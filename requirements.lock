@@ -12,6 +12,11 @@
 #   token provider (B5 行為變化); openai 2.54.0 now an EXPLICIT pin (CR-C2
 #   收窄面: only azure-identity + openai pinned this ring; pipecat-ai[azure]
 #   NOT introduced). Body below is a fresh `pip freeze`, 114 pins.
+# Appended (NOT a full regeneration): 2026-11-21 — azure-cognitiveservices-speech
+#   1.53.1 (pipecat 1.4.0 `azure` extra requires <2,>=1.47.0). Needed by
+#   `_build_pipeline`'s AzureSTTService; its absence was invisible because the
+#   import is lazy (see tests/test_azure_speech_import.py). All other pins are
+#   unchanged from the 2026-11-09 freeze.
 #
 # DISCREPANCY (U-001 acceptance criterion 1): the deploy target is Python 3.12
 # (deploy/cloudformation.yaml installs python3.12). No 3.12 interpreter exists on
@@ -41,6 +46,7 @@ aws-sdk-signers==0.1.0
 aws_sdk_bedrock_runtime==0.4.0
 awscrt==0.28.4
 azure-core==1.41.0
+azure-cognitiveservices-speech==1.53.1
 azure-identity==1.27.0
 bcrypt==5.0.0
 boto3==1.43.117
