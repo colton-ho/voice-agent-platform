@@ -32,6 +32,9 @@ param TELEPHONY_PROVIDER string = 'twilio'
 @description('spec §11 VOICE_ENGINE（cascade=FC-2+FC-3+FC-4）')
 param VOICE_ENGINE string = 'cascade'
 
+@description('电话路径引擎（env PHONE_ENGINE；decision (a)：nova-sonic 退役后 pipeline。与 §11 VOICE_ENGINE 是两个面——phone 路径读 PHONE_ENGINE）')
+param PHONE_ENGINE string = 'pipeline'
+
 @description('spec §11 STT_PROVIDER')
 param STT_PROVIDER string = 'azure_speech'
 
@@ -96,6 +99,14 @@ param twilioAccountSid string
 @description('§3.1 AUTHSECRET（B12：ephemeral fallback 退役，缺值 fail-fast）')
 @secure()
 param authSecretValue string
+
+@description('CR-C1 凭证面：Speech key（env SPEECH_KEY；pipeline STT 用，§11 无凭证占位符）')
+@secure()
+param speechKey string
+
+@description('CR-C1 凭证面：Azure OpenAI/Foundry key（env LLM_API_KEY；cascade 组合根用）')
+@secure()
+param llmApiKey string
 
 // ---- 手动前置资源（plan §5；留空 = 跳过 §5 #1/#2 派发，建成后重跑补派）----
 @description('§5 #1 手动 Foundry/AOAI 帐户完整资源 ID（plan §9 步骤 6 补派）')
@@ -308,6 +319,8 @@ module keyvault 'modules/keyvault.bicep' = {
     twilioAuthToken: twilioAuthToken
     twilioAccountSid: twilioAccountSid
     authSecretValue: authSecretValue
+    speechKey: speechKey
+    llmApiKey: llmApiKey
   }
 }
 
@@ -432,6 +445,7 @@ module containerApps 'modules/containerApps.bicep' = {
     PUBLIC_MEDIA_BASE_URL: PUBLIC_MEDIA_BASE_URL
     TELEPHONY_PROVIDER: TELEPHONY_PROVIDER
     VOICE_ENGINE: VOICE_ENGINE
+    PHONE_ENGINE: PHONE_ENGINE
     STT_PROVIDER: STT_PROVIDER
     TTS_PROVIDER: TTS_PROVIDER
     LLM_PROVIDER: LLM_PROVIDER

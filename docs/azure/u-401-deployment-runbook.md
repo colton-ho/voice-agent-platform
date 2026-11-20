@@ -30,21 +30,26 @@ Scope: `docs/azure/u-401-deployment-plan.md` §5/§8/§9 的操作面展开；�
 | `LLM_ENDPOINT` / `LLM_DEPLOYMENT` | §1.1 第 1 项 | Foundry 端点 + 部署名 |
 | `SPEECH_REGION` / `STT_LOCALE` / `TTS_VOICE` | §1.1 第 2 项 | |
 | `actionGroupEmail` | 运维告警邮箱 | monitor 告警接收者 |
-| `containerImage` | ACR 推送后的映像 | `acrvinebot<env>.azurecr.io/voicebot:<tag>` |
+| `containerImage` | ACR 推送后的映像 | **首布例外**：ACR 由本部署创建，首布时不可能已有映像 → 首布填公共占位映像（见步骤 4），步骤 9 推真映像后回填 |
 | `PUBLIC_CONTROL_BASE_URL` / `PUBLIC_MEDIA_BASE_URL` | **两遍回填**（§2 步骤 4/6） | 首布取 `RUNTIME_FQDN` 输出后回填 |
+| `PHONE_ENGINE` | 固定 `pipeline` | **电话路径真正读的引擎**（`bot.py` `PHONE_ENGINE` → 默认 `pipeline`）；`VOICE_ENGINE=cascade` 只作用于 cascade 组合根，不在 `/twilio/media-stream` 上——两者不是一回事，勿混 |
 | `MAX_CONCURRENT_CALLS_PER_REPLICA=3` / `MAX_CALL_DURATION_SECONDS=3600` / `TRANSCRIPT_RETENTION_DAYS=30` | 暂定值 | spec §11 占位符（`<load-tested-value>` 等）——压测/审批后回填，暂定值不阻塞首布 |
 | `foundryResourceId` / `speechResourceId` | §1.1 建成后 | RBAC 补派（§2 步骤 7），空=跳过 |
 | `budgetAmount`（0=不建）/ `budgetStartDate` / `budgetContactEmails` | 预算启用时 | D5 可选项 |
 | `controlHostName` / `mediaHostName` | 自定义域名启用时 | D2 三步舞（§2 步骤 8） |
 
-### 1.3 Secret 环境变量（§3.1 四值；值不落盘、不进 argv、不回显）
+### 1.3 Secret 环境变量（§3.1 四值 + CR-C1 两值；值不落盘、不进 argv、不回显）
 
 ```bash
 export MINIMAX_API_KEY=...      # → KV MINIMAX-API-KEY
 export TWILIO_AUTH_TOKEN=...    # → KV TWILIO-AUTH-TOKEN（TWILIO_AUTH_TOKEN_SECRET_NAME 指向此名）
 export TWILIO_ACCOUNT_SID=...   # → KV TWILIO-ACCOUNT-SID（X2：也入 Vault，env 注入值）
 export AUTH_SECRET=...          # → KV AUTHSECRET（B12：缺值 fail-fast）
+export SPEECH_KEY=...           # → KV SPEECH-KEY（CR-C1：pipeline STT 的 AzureSTTService 必需）
+export LLM_API_KEY=...          # → KV LLM-API-KEY（CR-C1：cascade 组合根用；pipeline LLM 走 MI，不需要）
 ```
+
+> **为什么多出两个**：spec §11 的 30 个占位符里**没有凭证位**（CR-C1 遗留缺口）。Credit 由环境变量经 `@secure()` 参数 → Key Vault → Container Apps `secretRef`（env `SPEECH_KEY` / `LLM_API_KEY`）注入，契约面一个字未改。缺 `SPEECH_KEY` 时应用**能启动但第一通电话在 STT 处失败**。
 
 ⚠️ **请勿以 `bash -x` 运行部署/灌密脚本**；`az keyvault secret set --value` 会短暂出现在本机进程表（ps），在可信操作机上执行。
 
@@ -83,10 +88,12 @@ scripts/deploy/deploy-azure.sh <dev|staging|prod>
 ### 步骤 4 · 首次部署（RG + 全模块）
 
 ```bash
-# §1.3 四个 secret 环境变量已 export
+# §1.3 六个 secret 环境变量已 export
+# 首布例外：containerImage 先填公共占位映像（ACR 由本次部署创建，尚无真映像）
 scripts/deploy/deploy-azure.sh <env> --apply
 ```
-- 创建：RG、Cosmos（8 容器）、Service Bus、Key Vault（4 secret 名占位）、MI×3 + RBAC、ACR、
+- **首布镜像鸡生蛋**：`--apply` 会拦截 `REPLACE_ME`，但 `containerImage` 在首布时无真值。做法：临时把 params 里的 `containerImage` 改为公共映像（如 `mcr.microsoft.com/azuredocs/aci-helloworld:latest`），首布完成后按步骤 9 推真映像再回填重跑。此期间 runtime app 会**运行占位映像**（不提供本服务）——属预期，不是故障。
+- 创建：RG、Cosmos（8 容器）、Service Bus、Key Vault（6 secret 名占位）、MI×3 + RBAC、ACR、
   Container Apps 环境 + app、Blob（私有）、Log Analytics + App Insights + 告警、（可选）证书/预算。
 - `PUBLIC_*_BASE_URL` 此时仍可为占位符（脚本只警告）——首布后**必须**做两遍回填（步骤 6）。
 - 完成后脚本打印部署输出：**记下 `RUNTIME_FQDN`**（步骤 6 用）。
@@ -130,6 +137,8 @@ network.bicep 只建托管证书 + 域名绑定（无 VNet/私有端点——D2 
 az acr build --registry acrvinebot<env> --image voicebot:<tag> .   # 或 az acr login + docker push
 ```
 `containerImage` 回填 `acrvinebot<env>.azurecr.io/voicebot:<tag>` → 重跑 `--apply`。
+- 首布用的是占位公共映像（步骤 4），**这一步才是本服务第一次真正跑起来**：确认 revision 拉取成功、`/api/auth/setup-status` 返回 200、日志无 `SPEECH_KEY`/`AUTH_SECRET` 缺值 fail-fast。
+- 若镜像构建失败：先本地 `az acr build` 看完整报错（`pip install -r requirements.txt -c requirements.lock` 是首次验证点，见 `Dockerfile` 头注释）。
 - control 与 runtime **共用同一映像**（D3：`bot.py` 单进程承 control+media；`includeControlApp=false`，
   进程拆分属代码侧后续项，不属 U-401）。
 - worker 入口：`python workers/postcall_worker.py`（`workerCommand`）。
@@ -199,12 +208,13 @@ Container Apps 挂 **Azure Files 卷**到配置目录（`configMountPath=/app/co
 
 ## 6. Secret 手动轮换（pipeline-infra-spec §3.2；**无自动轮换**）
 
-KV 无内置自动轮换；仅 3–4 个 secret，**不建轮换 Function/Logic App**（防过度设计）。轮换即手动：
+KV 无内置自动轮换；仅 6 个 secret，**不建轮换 Function/Logic App**（防过度设计）。轮换即手动：
 
 ```bash
-# 1) 外部侧先换新值（Twilio 控制台换 AuthToken / MiniMax 控制台换 key / 生成新 AUTH_SECRET）
+# 1) 外部侧先换新值（Twilio 控制台换 AuthToken / MiniMax 控制台换 key / Speech 资源换 key /
+#    Foundry 换 key / 生成新 AUTH_SECRET）
 # 2) 灌入 KV（新值经环境变量，不落盘）：
-export TWILIO_AUTH_TOKEN=<新值>   # 换哪个 export 哪个
+export TWILIO_AUTH_TOKEN=<新值>   # 换哪个 export 哪个（SPEECH_KEY 轮换同理）
 scripts/deploy/set-secrets.sh <env>
 # 3) ACA 自动取新值（≤30 分钟刷新并重启副本）；急用时手动重启三个 app
 # 4) 验证：webhook 验签 / TTS 调用 / JWT 签发各打一发冒烟

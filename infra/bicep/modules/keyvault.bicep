@@ -1,4 +1,5 @@
-// modules/keyvault.bicep — pipeline-infra-spec §3：vault + 4 secrets（§3.1）
+// modules/keyvault.bicep — pipeline-infra-spec §3：vault + 6 secrets（§3.1 四值 +
+// CR-C1 凭证面两值 SPEECH-KEY/LLM-API-KEY）
 // + RBAC（§5 #3 Key Vault Secrets User，role assignment 归 identities.bicep/U-401）。
 // 只落碼不部署；secret 值只经 @secure() 部署参数注入——绝不落盘/入配置/入模板字面量。
 // 命名/参数只引用 config_contract.py 冻结变量名（§11），不新造契约面。
@@ -25,6 +26,14 @@ param twilioAccountSid string
 @secure()
 param authSecretValue string
 
+@description('CR-C1 凭证面：Speech 资源 key（env SPEECH_KEY；§11 无凭证占位符，按 CR-C1 注入缝补）')
+@secure()
+param speechKey string
+
+@description('CR-C1 凭证面：Azure OpenAI/Foundry key（env LLM_API_KEY；cascade 组合根用，pipeline 走 MI）')
+@secure()
+param llmApiKey string
+
 resource vault 'Microsoft.KeyVault/vaults@2023-07-01' = {
   name: keyVaultName
   location: AZURE_LOCATION
@@ -40,11 +49,15 @@ resource vault 'Microsoft.KeyVault/vaults@2023-07-01' = {
 }
 
 // §3.1 secret 清单 1:1（名钉死；轮换=手动流程记 U-406 runbook，不建轮换 Function）
+// + CR-C1 凭证面两条（SPEECH-KEY / LLM-API-KEY）：§11 无凭证占位符，故走 CR-C1
+// 注入缝（env → @secure() 参数 → Vault → containerApps env secretRef），不改契约面。
 var secrets = [
   { name: 'MINIMAX-API-KEY', value: minimaxApiKey }
   { name: 'TWILIO-AUTH-TOKEN', value: twilioAuthToken }
   { name: 'TWILIO-ACCOUNT-SID', value: twilioAccountSid }
   { name: 'AUTHSECRET', value: authSecretValue }
+  { name: 'SPEECH-KEY', value: speechKey }
+  { name: 'LLM-API-KEY', value: llmApiKey }
 ]
 
 resource kvSecrets 'Microsoft.KeyVault/vaults/secrets@2023-07-01' = [for s in secrets: {

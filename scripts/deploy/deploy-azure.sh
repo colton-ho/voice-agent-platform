@@ -14,12 +14,13 @@
 #   scripts/deploy/deploy-azure.sh <dev|staging|prod>            # what-if 预演
 #   scripts/deploy/deploy-azure.sh <dev|staging|prod> --apply    # 真正部署
 #
-# --apply 需要的环境变量（§3.1 四值）:
+# --apply 需要的环境变量（§3.1 四值 + CR-C1 凭证面两值）:
 #   MINIMAX_API_KEY  TWILIO_AUTH_TOKEN  TWILIO_ACCOUNT_SID  AUTH_SECRET
+#   SPEECH_KEY       LLM_API_KEY
 set -euo pipefail
 
 usage() {
-  sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'
   exit 1
 }
 
@@ -88,7 +89,7 @@ echo "将创建/更新（plan §1 拓扑）:"
 echo "  - 资源组 rg-voicebot-$ENV"
 echo "  - Cosmos cosmos-voicebot-${ENV}（voicebot 库 + 8 容器，§1.1–1.4）"
 echo "  - Service Bus sb-voicebot-$ENV + postcall-jobs 队列（§2.1 六值）"
-echo "  - Key Vault kv-voicebot-$ENV + 4 secrets（§3.1）"
+echo "  - Key Vault kv-voicebot-$ENV + 6 secrets（§3.1 四值 + CR-C1 两值）"
 echo "  - MI ×3 mi-voicebot-$ENV-{runtime,control,worker} + RBAC 行 1–8（§5）"
 echo "  - ACR acrvinebot$ENV"
 echo "  - Container Apps 环境 cae-voicebot-$ENV + app（runtime/worker；control 视 includeControlApp）"
@@ -114,10 +115,10 @@ if [ "$APPLY" = 1 ]; then
   if grep -Eq '^param PUBLIC_(CONTROL|MEDIA)_BASE_URL = .*REPLACE_ME' "$PARAMS_FILE"; then
     echo "警告：PUBLIC_*_BASE_URL 仍为占位符——首布后按 runbook §2 步骤 4/6 取 RUNTIME_FQDN 回填并重跑 --apply"
   fi
-  for v in MINIMAX_API_KEY TWILIO_AUTH_TOKEN TWILIO_ACCOUNT_SID AUTH_SECRET; do
+  for v in MINIMAX_API_KEY TWILIO_AUTH_TOKEN TWILIO_ACCOUNT_SID AUTH_SECRET SPEECH_KEY LLM_API_KEY; do
     # 只验非空，值不经 shell 展开打印（防 set -x 泄露）
     if ! printenv "$v" 2>/dev/null | grep -q '.'; then
-      echo "错误：secret 环境变量 $v 缺失或为空（§3.1；值不回显）"
+      echo "错误：secret 环境变量 $v 缺失或为空（§3.1 + CR-C1；值不回显）"
       exit 1
     fi
   done
@@ -131,5 +132,6 @@ else
   echo ""
   echo "预演结束。确认变更无误且已取得用户明示授权后执行："
   echo "  MINIMAX_API_KEY=... TWILIO_AUTH_TOKEN=... TWILIO_ACCOUNT_SID=... AUTH_SECRET=... \\"
+  echo "  SPEECH_KEY=... LLM_API_KEY=... \\"
   echo "    $0 $ENV --apply"
 fi

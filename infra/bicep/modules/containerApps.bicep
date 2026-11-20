@@ -159,6 +159,9 @@ param TELEPHONY_PROVIDER string = 'twilio'
 @description('spec §11 VOICE_ENGINE（cascade=FC-2+FC-3+FC-4）')
 param VOICE_ENGINE string = 'cascade'
 
+@description('电话路径引擎（env PHONE_ENGINE；phone 路径读此值，默认 pipeline）')
+param PHONE_ENGINE string = 'pipeline'
+
 @description('spec §11 STT_PROVIDER')
 param STT_PROVIDER string = 'azure_speech'
 
@@ -302,6 +305,10 @@ var commonEnv = [
     value: VOICE_ENGINE
   }
   {
+    name: 'PHONE_ENGINE'
+    value: PHONE_ENGINE
+  }
+  {
     name: 'STT_PROVIDER'
     value: STT_PROVIDER
   }
@@ -409,6 +416,14 @@ var commonEnv = [
   {
     name: 'TWILIO_AUTH_TOKEN'
     secretRef: 'twilio-auth-token'
+  }
+  {
+    name: 'SPEECH_KEY'
+    secretRef: 'speech-key'
+  }
+  {
+    name: 'LLM_API_KEY'
+    secretRef: 'llm-api-key'
   }
   {
     name: 'MINIMAX_GROUP_ID'
@@ -520,6 +535,19 @@ resource apps 'Microsoft.App/containerApps@2024-03-01' = [for s in appSpecs: {
         {
           name: 'twilio-account-sid'
           keyVaultUrl: '${KEY_VAULT_URL}secrets/TWILIO-ACCOUNT-SID'
+          identity: s.identityId
+        }
+        // CR-C1 凭证面（§11 无凭证占位符）：Speech key + LLM key。pipeline STT
+        // 需要 SPEECH_KEY；LLM 走 MI（RBAC 由 foundryResourceId 补派），
+        // LLM_API_KEY 只服务 cascade 组合根。
+        {
+          name: 'speech-key'
+          keyVaultUrl: '${KEY_VAULT_URL}secrets/SPEECH-KEY'
+          identity: s.identityId
+        }
+        {
+          name: 'llm-api-key'
+          keyVaultUrl: '${KEY_VAULT_URL}secrets/LLM-API-KEY'
           identity: s.identityId
         }
       ]

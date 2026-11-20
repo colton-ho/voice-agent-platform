@@ -16,7 +16,7 @@ Resource group `rg-voicebot-<env>`，單區域（`AZURE_LOCATION`，cost-analysi
 |---|---|---|
 | Cosmos DB 帳戶 + `voicebot` 庫 + 8 容器 | `modules/cosmos.bicep`（**已建**） | §1.1/§1.2/§1.3/§1.4 全落定；CI-1 複合索引；Session；Continuous 備份 |
 | Service Bus `sb-voicebot-<env>` + `postcall-jobs` 隊列 | `modules/servicebus.bicep`（**已建**） | §2.1 六值顯式；DLQ 內建 |
-| Key Vault + 4 secrets | `modules/keyvault.bicep`（**已建**） | §3.1 清單；RBAC 啟用 |
+| Key Vault + 6 secrets | `modules/keyvault.bicep`（**已建**） | §3.1 清單四值 + CR-C1 凭证面两值（SPEECH-KEY / LLM-API-KEY，[2026-11-20]）；RBAC 啟用 |
 | User-assigned MI ×3（mi-runtime/mi-control/mi-worker）+ role assignments | `modules/identities.bicep`（新建） | §5 十行 RBAC 矩陣 |
 | ACR | `modules/acr.bicep`（新建） | 映像倉庫（AcrPull→MI） |
 | Container Apps env + control/runtime/worker 三 app | `modules/containerApps.bicep`（新建） | §8.3 部署要求；§11 環境契約注入 |

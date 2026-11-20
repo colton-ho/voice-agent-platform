@@ -13,6 +13,8 @@ param PUBLIC_CONTROL_BASE_URL = 'https://REPLACE_ME'
 param PUBLIC_MEDIA_BASE_URL = 'wss://REPLACE_ME'
 param TELEPHONY_PROVIDER = 'twilio'
 param VOICE_ENGINE = 'cascade'
+// 电话路径真正读的是 PHONE_ENGINE（decision (a)：nova-sonic 退役 → pipeline）。
+param PHONE_ENGINE = 'pipeline'
 param STT_PROVIDER = 'azure_speech'
 param TTS_PROVIDER = 'azure_speech'
 param LLM_PROVIDER = 'azure_openai'
@@ -32,6 +34,9 @@ param minimaxApiKey = readEnvironmentVariable('MINIMAX_API_KEY', 'UNSET-SECRET-D
 param twilioAuthToken = readEnvironmentVariable('TWILIO_AUTH_TOKEN', 'UNSET-SECRET-DO-NOT-USE')
 param twilioAccountSid = readEnvironmentVariable('TWILIO_ACCOUNT_SID', 'UNSET-SECRET-DO-NOT-USE')
 param authSecretValue = readEnvironmentVariable('AUTH_SECRET', 'UNSET-SECRET-DO-NOT-USE')
+// CR-C1 凭证面（§11 无凭证占位符）：SPEECH_KEY 供 pipeline STT；LLM_API_KEY 供 cascade 组合根。
+param speechKey = readEnvironmentVariable('SPEECH_KEY', 'UNSET-SECRET-DO-NOT-USE')
+param llmApiKey = readEnvironmentVariable('LLM_API_KEY', 'UNSET-SECRET-DO-NOT-USE')
 
 // —— 手动前置资源 ID（plan §5 建成后回填）——
 param foundryResourceId = ''
