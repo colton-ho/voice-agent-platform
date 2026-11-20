@@ -410,8 +410,8 @@ def test_admin_history_summarize_c9_accepts_and_enqueues_job(admin_app, monkeypa
     from storage import servicebus as _sb
 
     fake = admin_app._fake_cosmos
-    _seed_call(fake, "s1", lang="en-US", summary_status="failed",
-               summary_error="stale-error")
+    _seed_call(fake, "s1", lang="en-US", model="nova-2-lite",
+               summary_status="failed", summary_error="stale-error")
     _seed_turns(fake, "s1", [
         {"who": "bot", "text": "Hello", "t": 1},
         {"who": "user", "text": "Reset password please", "t": 2},
@@ -435,8 +435,11 @@ def test_admin_history_summarize_c9_accepts_and_enqueues_job(admin_app, monkeypa
         doc = _call_doc(fake, "s1")
         assert doc["summary_status"] == "pending"
 
+        # U-304：信封带 lang_key/model_key（行内调用上下文快照）；turns 不入
+        # 信封、worker 以 call_id 经 repo 重拼。
         assert q.sent == [("summary:s1", {
             "job_type": "summary", "job_id": "summary:s1", "call_id": "s1",
+            "lang_key": "en-US", "model_key": "nova-2-lite",
         })]
     finally:
         _sb.reset_queue_provider()

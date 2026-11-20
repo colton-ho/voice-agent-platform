@@ -106,6 +106,7 @@ Namespace：`sb-voicebot-<env>`（=spec §11 `SERVICEBUS_NAMESPACE`）。**單�
 ### 2.2 post-call 冪等 job（R-A-010）：投遞 / 消費 / 重試 / 30s 超時形態
 
 - **投遞**：通話結束（BYE/write-before-teardown，call_control_tools.py:123–137 語義保留）→ 投 `{"job_type":"summary","job_id":"summary:<call_id>","call_id":...}`，`MessageId=job_id`。生產=at-most-once（與現狀 fire-and-forget 等同，進程崩潰仍可能丟——**outbox 不預建**，Phase D 議）。投遞方：runtime（mi-runtime，Data Sender）；管理端 re-summarize（bot.py:4090）**已裁決（team-lead 2026-11-09）：投同隊列異步**——`POST /api/admin/history/{call_id}/summarize` 回 `200 {call_id, summary_status:"pending"}` 受理 → 行翻 pending → worker 終態；入隊/持久化失敗仍 `500 {error}`。**C-9 註冊生效**（re-summarize 回應語義：`summary` 省略 + `summary_status:"pending"`，additive/behavioral）。理由：B7 的「超時=暫時性可重試」只在 worker 模型成立（同步 30s 硬超時只能即刻返 failed，行為分裂）；單一摘要路徑=單一重試/冪等語義（R-1…R-4）；SPA 已驗證容忍（零代碼改動）。
+  **加法擴展 v2026-11-20（U-304 裁決 team-lead 2026-11-20；上方 3 字段凍結文本不改寫）**：實際投遞信封為 **5 字段**——在凍結 3 字段（`job_type`/`job_id`/`call_id`）之外增加 `lang_key`、`model_key`（調用上下文快照，供 worker 側 invoke 使用；model_key=通話自身的模型，摘要在該 model_key 上跑）。舊 3 字段信封仍被接受：worker 對缺省鍵回落行內 `lang`/`model` 欄位（workers/postcall_worker.py 消費註釋）。`turns` 恆不入信封，worker 以 `call_id` 經 repo 重拼。版本化擴展：v2026-11-20，additive/binary-compatible（MessageId=job_id 不變）。
 - **消費**：worker（mi-worker，Data Receiver）peek-lock 處理：
   1. 以 `calls.summary_status`/etag 查重：已 **`ok`** → 直接 complete（重複投遞無副作用，R-A-010；wire enum `{pending, ok, failed}`——product-impact §7.1 釘死，**不得引入第四個值**）；
   2. 空轉寫短路語義保留（bot.py:5641–5649，不發 LLM 請求寫空結構）；

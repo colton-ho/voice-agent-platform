@@ -119,9 +119,11 @@ def fake(monkeypatch):
 
 
 CANONICAL_KEYS = {
-    "id", "label", "lang", "system", "greeting",
+    "id", "label", "lang",
+    "engine", "provider", "voice", "model",
+    "system", "greeting",
     "kb_intro", "kb_ack", "kb_body", "tool_ids",
-    "mcp_servers", "filler", "tags",
+    "mcp_servers", "filler", "asr_filter", "tags",
 }
 
 
@@ -174,8 +176,11 @@ def test_migrate_writes_all_fields_matching_loader(fake, sample_data_root):
             assert stored is not None
             assert expected is not None
             # DemoLoader.get adds a filesystem-only `_dir` key; the canonical
-            # store shape does not have it. Compare on the canonical key set.
+            # store shape does not have it. Compare on the canonical key set
+            # (incl. the per-demo override keys engine/provider/voice/model and
+            # asr_filter — C4 drift fix: the shared normalizer owns the shape).
             assert set(stored.keys()) == CANONICAL_KEYS
+            assert set(expected.keys()) == CANONICAL_KEYS | {"_dir"}
             for k in CANONICAL_KEYS:
                 assert stored[k] == expected[k], f"{demo_id}.{k} mismatch"
 

@@ -133,9 +133,11 @@ def test_validate_valid_pipeline_combo():
 
 
 def test_validate_valid_pipeline_polly_combo():
+    # Polly retired from TTS_PROVIDERS (Azure migration): provider=polly 400s.
     b = _body(engine="pipeline", provider="polly", voice=POLLY_VOICE)
-    clean = _validate(b, {"engine", "provider", "voice"})
-    assert clean == {"engine": "pipeline", "provider": "polly", "voice": POLLY_VOICE}
+    with pytest.raises(HTTPException) as ei:
+        _validate(b, {"engine", "provider", "voice"})
+    assert ei.value.status_code == 400
 
 
 def test_validate_valid_nova_combo():
@@ -260,7 +262,10 @@ def test_validate_engine_unset_lenient_accepts_nova_or_pipeline_voice():
     # Neither body nor demo sets engine → lenient: accept a voice that resolves
     # in EITHER table (real engine decided at launch). Reviewer note #3.
     assert _validate(_body(voice=MINIMAX_VOICE), {"voice"}) == {"voice": MINIMAX_VOICE}
-    assert _validate(_body(voice=POLLY_VOICE), {"voice"}) == {"voice": POLLY_VOICE}
+    # Polly retired from TTS_PROVIDERS (Azure migration): a polly voice no
+    # longer resolves in the lenient either-table check.
+    with pytest.raises(HTTPException):
+        _validate(_body(voice=POLLY_VOICE), {"voice"})
     # Re-pointed (ruling B 2026-11-09): the C-3 emptied nova table resolves no
     # id, so a former nova voice no longer passes the lenient either-table rule.
     with pytest.raises(HTTPException):

@@ -1,0 +1,66 @@
+# U-402 · CI gate — spec §12 steps 1-2 (lint/type-check + unit/contract tests;
+# dependency/secret/IaC scans). Reusable by release.yml (workflow_call) so the
+# release sequence runs the SAME gate, never a weaker copy.
+#
+# Image scanning (§12 step 2, image lane) happens in release.yml after the
+# build-once step — an image does not exist before that point.
+name: ci
+
+on:
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  lint-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # No ruff/mypy config exists in the repo yet (documented gap G-4);
+      # compileall is the honest lint/type-check stand-in until one lands.
+      - name: Lint stand-in — byte-compile all runtime code
+        run: python -m compileall -q bot.py workers storage providers tests
+
+      - name: Unit + contract tests
+        run: python -m pytest tests/ -q
+
+      # §12 step 4 partial: Bicep syntactic validation (no Azure calls).
+      # Environment what-if runs in release.yml against real targets.
+      - name: Bicep build — validate all modules compile
+        run: |
+          az bicep install
+          az bicep build --file infra/bicep/main.bicep
+          for f in infra/bicep/modules/*.bicep; do
+            az bicep build --file "${f}"
+          done
+
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      # §12 step 2: dependencies, secrets, IaC (misconfig) in one pass.
+      - name: Trivy FS — dependency / secret / IaC scan
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,secret,misconfig
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: '1'

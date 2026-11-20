@@ -495,7 +495,10 @@ resource apps 'Microsoft.App/containerApps@2024-03-01' = [for s in appSpecs: {
   properties: {
     managedEnvironmentId: managedEnvironment.id
     configuration: {
-      activeRevisionsMode: 'Single'
+      // U-402 P1（blue-green-release.md §5）：带 ingress 的 app（runtime/control）须
+      // Multiple 才能做修订版流量切分（蓝绿）；worker 无 ingress 且 minReplicas=1，
+      // Multiple 会让旧修订版持续保活空占副本，保持 Single。
+      activeRevisionsMode: s.httpIngress ? 'Multiple' : 'Single'
       // plan §4 主通道：Key Vault 引用（keyVaultUrl+identity，MI 解析）→ env secretRef；
       // secret 不落 env 文件/模板字面量；不钉版本=随 KV 轮换 30 分钟内自动刷新
       secrets: [

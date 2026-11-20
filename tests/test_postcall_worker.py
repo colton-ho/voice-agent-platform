@@ -76,7 +76,7 @@ async def test_v6_normal_completion_writes_ok_and_completes(world):
     _seed_pending(repo)
     calls = []
 
-    async def invoke(turns, lang):
+    async def invoke(turns, lang, model_key=""):
         calls.append((turns, lang))
         return _ok_struct()
 
@@ -104,7 +104,7 @@ async def test_v6_retry_exhaustion_settles_failed_terminal(world):
     repo, queue = world["repo"], world["queue"]
     _seed_pending(repo)
 
-    async def invoke(turns, lang):
+    async def invoke(turns, lang, model_key=""):
         raise RuntimeError("llm down")
 
     worker = PostcallWorker(repo, invoke, queue)
@@ -128,7 +128,7 @@ async def test_transient_failure_abandons_without_marking_failed(world):
     repo, queue = world["repo"], world["queue"]
     _seed_pending(repo)
 
-    async def invoke(turns, lang):
+    async def invoke(turns, lang, model_key=""):
         raise RuntimeError("429 blip")
 
     worker = PostcallWorker(repo, invoke, queue)
@@ -146,7 +146,7 @@ async def test_timeout_budget_is_transient_left_for_next_round(world):
     repo, queue = world["repo"], world["queue"]
     _seed_pending(repo)
 
-    async def slow(turns, lang):
+    async def slow(turns, lang, model_key=""):
         await asyncio.sleep(5)
 
     worker = PostcallWorker(repo, slow, queue, timeout_s=0.05)
@@ -168,7 +168,7 @@ async def test_idempotent_ok_row_completes_without_invoke(world):
     repo.patch_fields("c1", {"summary": _ok_struct(), "summary_status": "ok"})
     calls = []
 
-    async def invoke(turns, lang):
+    async def invoke(turns, lang, model_key=""):
         calls.append(1)
         return _ok_struct()
 
@@ -184,7 +184,7 @@ async def test_permanent_failure_settles_failed_on_first_delivery(world):
     repo, queue = world["repo"], world["queue"]
     _seed_pending(repo)
 
-    async def invoke(turns, lang):
+    async def invoke(turns, lang, model_key=""):
         raise ValueError("bad call config")
 
     worker = PostcallWorker(repo, invoke, queue)
@@ -208,7 +208,7 @@ async def test_explicit_permanent_job_error_settles_failed_without_retry(world):
     repo, queue = world["repo"], world["queue"]
     _seed_pending(repo)
 
-    async def invoke(turns, lang):
+    async def invoke(turns, lang, model_key=""):
         raise PermanentJobError("summary schema drift")
 
     worker = PostcallWorker(repo, invoke, queue)
@@ -236,6 +236,59 @@ async def test_non_summary_job_is_dropped_without_row_touch(world):
     doc = repo.get_history_doc("c1")
     assert doc["summary_status"] == "pending"
     assert queue.completed == [msg]
+
+
+# ---------------------------------------------------------------------------
+# U-304 信封上下文：lang_key/model_key 随信封传递（turns 由 call_id 引用重拼）
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_envelope_lang_and_model_keys_drive_invoke(world):
+    """信封 lang_key/model_key 优先于行内字段——发佈方快照是调用上下文真源。
+
+    被调方签名 = _invoke_summary_bedrock(turns, lang_key, *, model_key=...)，
+    与 /api/summary 的传参同形；turns 不入信封、由 call_id 经 repo 重拼。
+    """
+    repo, queue = world["repo"], world["queue"]
+    _seed_pending(repo)
+    repo.patch_fields("c1", {"lang": "en-US", "model": "nova-2-lite"})
+    seen = {}
+
+    async def invoke(turns, lang, model_key=""):
+        seen["lang"] = lang
+        seen["model_key"] = model_key
+        return _ok_struct()
+
+    worker = PostcallWorker(repo, invoke, queue)
+    queue.inject(
+        {
+            "job_type": "summary", "job_id": "summary:c1", "call_id": "c1",
+            "lang_key": "ja-JP", "model_key": "claude-haiku-4.5",
+        },
+        delivery_count=1,
+    )
+    msg = queue.receive()[0]
+    assert await worker.handle(msg) == "completed"
+    assert seen == {"lang": "ja-JP", "model_key": "claude-haiku-4.5"}
+    assert repo.get_history_doc("c1")["summary_status"] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_legacy_envelope_falls_back_to_row_fields(world):
+    """旧三字段信封（无 lang_key/model_key）回落行内 lang/model——重放安全。"""
+    repo, queue = world["repo"], world["queue"]
+    _seed_pending(repo)
+    repo.patch_fields("c1", {"lang": "zh-HK", "model": "nova-lite"})
+    seen = {}
+
+    async def invoke(turns, lang, model_key=""):
+        seen["lang"] = lang
+        seen["model_key"] = model_key
+        return _ok_struct()
+
+    worker = PostcallWorker(repo, invoke, queue)
+    msg = _msg(queue, delivery_count=1)  # JOB = 三字段旧信封
+    assert await worker.handle(msg) == "completed"
+    assert seen == {"lang": "zh-HK", "model_key": "nova-lite"}
 
 
 # ---------------------------------------------------------------------------

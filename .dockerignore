@@ -1,0 +1,40 @@
+# U-402 G-1 — build-context exclusions for the root runtime image.
+# The Dockerfile copies the runtime tree explicitly; this file exists to keep
+# the `az acr build` context small and to guarantee that excluded trees can
+# never leak into the image even via a future broad COPY.
+
+# VCS / CI / env — never send local env files to a remote builder (ACR).
+.git
+.github
+.env
+.env.*
+!.env.example
+
+# Local environments (the dev .venv alone is ~757M).
+.venv
+venv
+**/__pycache__
+*.pyc
+
+# Vendored ./pipecat — 1.1.x-era reference source tree. MUST NEVER be copied:
+# `import pipecat` from /app would shadow the pip-installed pipecat-ai 1.4.0
+# (same rule as deploy/deploy.sh:70 excluding it from the deploy tarball).
+pipecat
+
+# Not part of the runtime image.
+tests
+docs
+infra
+deploy
+scripts
+output
+voice-server
+node_modules
+
+# Dev-only AWS smoke probes (smoke_bedrock/polly/transcribe/minimax.py);
+# nothing in the bot import chain references them.
+smoke_*.py
+
+# Docs and misc root files the runtime never reads.
+*.md
+*.pdf

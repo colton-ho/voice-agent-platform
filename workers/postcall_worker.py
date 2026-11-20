@@ -45,7 +45,8 @@ class PostcallWorker:
     """peek-lock 消费 postcall-jobs：repo/ invoke/ queue 全注入（可测）。
 
     repo: storage.cosms_calls 形状（get_history_doc / patch_fields）。
-    invoke_summary: async (turns, lang) -> summary dict（生产=bot._invoke_summary_bedrock，
+    invoke_summary: async (turns, lang_key, *, model_key="") -> summary dict
+    （生产=bot._invoke_summary_bedrock，与 /api/summary 传参同形；
     空转写短路语义在其内部保留：不发 LLM 请求写空结构）。
     queue: storage.servicebus 4 动词队列。
     """
@@ -93,11 +94,15 @@ class PostcallWorker:
             self._queue.complete(msg)
             return "completed"
 
+        # turns 恒由 call_id 引用经 repo 重拼（信封不复制转写）；lang_key/
+        # model_key 优先取信封（发佈方快照），旧三字段信封回落行内字段（U-304）。
         turns = doc.get("turns") or []
-        lang = doc.get("lang") or ""
+        lang_key = job.get("lang_key") or doc.get("lang") or ""
+        model_key = job.get("model_key") or doc.get("model") or ""
         try:
             struct = await asyncio.wait_for(
-                self._invoke(turns, lang), timeout=self._timeout_s
+                self._invoke(turns, lang_key, model_key=model_key),
+                timeout=self._timeout_s,
             )
         except (ValueError, TypeError, KeyError, AttributeError) as e:
             return await self._settle_failed(msg, call_id, e)

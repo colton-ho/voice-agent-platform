@@ -1,0 +1,358 @@
+# U-402 · release pipeline — spec §12 CI/CD sequence (steps 1-8) end to end.
+#
+#   1. lint/tests            -> job gate          (reuses .github/workflows/ci.yml)
+#   2. scans                 -> job gate          (dep/secret/IaC) + job build (image)
+#   3. build once by digest  -> job build         (ACR build -> resolve sha256 digest)
+#   4. Bicep what-if         -> whatif-staging    (read-only) + release-prod step 2
+#   5. staging deploy+smoke  -> deploy-staging, smoke-staging
+#   6. production approval   -> release-prod's GitHub Environment (required reviewers)
+#   7. green deploy + readiness + routing switch -> release-prod steps 5-10
+#   8. drain old runtime + watch                -> release-prod steps 11-14
+#
+# Hard rules honoured here (spec §12 final note; blue-green-release.md §2/§8):
+#   - OIDC federated login only — NO stored Azure credentials anywhere.
+#   - the image is built ONCE (staging ACR) and promoted BY DIGEST
+#     (az acr import, digest-preserving) — never rebuilt between gates.
+#   - the ONLY traffic mutation is the routing switch step
+#     (az containerapp ingress traffic set). Prod infrastructure is never
+#     applied by this workflow (the prod what-if is read-only; the green
+#     runtime is deployed as a new Container Apps revision).
+#   - blue/green orchestration is exactly docs/azure/blue-green-release.md:
+#     green holds 0% until the switch; blue is drained via
+#     scripts/deploy/drain-runtime.sh and retired only after drain-complete
+#     and a clean watch window (the rollback runway).
+#   - a watch regression rolls new calls back to blue (§7) — never a hard
+#     teardown; forced-drain stays a human decision (§6).
+#
+# This workflow changes nothing on its own: workflow_dispatch only, and every
+# mutating run sits behind its GitHub Environment (staging) / required-reviewer
+# gate (prod). First run requires explicit user authorization (repo iron rule).
+name: release
+
+on:
+  workflow_dispatch:
+    inputs:
+      deploy_prod:
+        description: 'Run the production half (steps 6-8) after staging smoke'
+        type: boolean
+        default: true
+      drain_deadline_minutes:
+        description: 'Blue drain deadline (>= MAX_CALL_DURATION_SECONDS/60)'
+        type: string
+        default: '60'
+      watch_minutes:
+        description: 'Post-switch watch window before retiring blue'
+        type: string
+        default: '30'
+      rollback_on_regression:
+        description: 'Flip new calls back to blue on watch regression (§7)'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  id-token: write   # OIDC federation — the only Azure auth material
+
+# Never cancel a release mid-flight: routing switches must be atomic to a run.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  ACR_STAGING: acrvinebotstaging
+  ACR_PROD: acrvinebotprod
+  COSMOS_DATABASE: voicebot
+
+jobs:
+  # ---- §12 steps 1-2 (lint/tests + dep/secret/IaC scans) ------------------
+  gate:
+    uses: ./.github/workflows/ci.yml
+
+  # ---- §12 step 3: build once, identify by digest ------------------------
+  build:
+    needs: gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    environment: staging   # OIDC subject env-scoped to staging (ACR push)
+    outputs:
+      digest: ${{ steps.digest.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Gap G-1 (docs/azure/ci-cd-pipeline.md): the voicebot runtime image
+      # (python bot.py per infra/bicep/main.bicep runtimeCommand) has no
+      # Dockerfile in-repo yet. Fail loudly and early instead of building
+      # the wrong thing (voice-server/Dockerfile is the legacy Node SIP app).
+      - name: Preflight — runtime image Dockerfile present
+        run: |
+          if [ ! -f Dockerfile ]; then
+            echo "::error::No Dockerfile at repo root for the voicebot runtime image — see gap G-1 in docs/azure/ci-cd-pipeline.md (out of U-402 footprint; needs an owner decision)."
+            exit 1
+          fi
+
+      - name: Azure login (OIDC — federated credentials, no stored secrets)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Build once (ACR build, commit-SHA tag)
+        run: az acr build --registry "${ACR_STAGING}" --image "voicebot:${GITHUB_SHA}" --file Dockerfile .
+
+      - name: Identify image by digest (the promotion key)
+        id: digest
+        run: |
+          DIGEST="$(az acr repository show --name "${ACR_STAGING}" --image "voicebot:${GITHUB_SHA}" --query digest -o tsv)"
+          [ -n "${DIGEST}" ] || { echo "::error::could not resolve image digest"; exit 1; }
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "built once: ${ACR_STAGING}.azurecr.io/voicebot@${DIGEST}"
+
+      - name: ACR login for image scan
+        run: az acr login --name "${ACR_STAGING}"
+
+      # §12 step 2, image lane (deps/secrets/IaC covered in the gate's scan job).
+      - name: Trivy image scan
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: image
+          image-ref: ${{ env.ACR_STAGING }}.azurecr.io/voicebot@${{ steps.digest.outputs.digest }}
+          scanners: vuln,secret
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: '1'
+
+  # ---- §12 step 4 (staging half): Bicep what-if, read-only ---------------
+  whatif-staging:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: staging
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Materialize digest-pinned image into params (ephemeral runner checkout)
+        run: |
+          sed -i.bak "s#^param containerImage = .*#param containerImage = '${ACR_STAGING}.azurecr.io/voicebot@${{ needs.build.outputs.digest }}'#" infra/bicep/params/staging.bicepparam
+
+      - name: Bicep what-if (deploy-azure.sh default mode = read-only)
+        run: bash scripts/deploy/deploy-azure.sh staging
+
+  # ---- §12 step 5: deploy staging ---------------------------------------
+  deploy-staging:
+    needs: [build, whatif-staging]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: staging
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      # App secrets live ONLY in Key Vault (the runtime reads the same KV via
+      # MI references) — nothing secret is stored in GitHub or the repo.
+      - name: Resolve app secrets from Key Vault (masked)
+        run: |
+          KV="kv-voicebot-staging"
+          get() { v="$(az keyvault secret show --vault-name "${KV}" --name "$1" --query value -o tsv)"; echo "::add-mask::${v}"; echo "$2=${v}" >> "$GITHUB_ENV"; }
+          get MINIMAX-API-KEY MINIMAX_API_KEY
+          get AUTHSECRET AUTH_SECRET
+          get TWILIO-AUTH-TOKEN TWILIO_AUTH_TOKEN
+          get TWILIO-ACCOUNT-SID TWILIO_ACCOUNT_SID
+
+      - name: Materialize digest-pinned image into params (ephemeral runner checkout)
+        run: |
+          sed -i.bak "s#^param containerImage = .*#param containerImage = '${ACR_STAGING}.azurecr.io/voicebot@${{ needs.build.outputs.digest }}'#" infra/bicep/params/staging.bicepparam
+
+      # deploy-azure.sh keeps its own --apply gates (REPLACE_ME + secret env).
+      - name: Deploy staging (deploy-azure.sh --apply)
+        run: bash scripts/deploy/deploy-azure.sh staging --apply
+
+  # ---- §12 step 5: staging smoke ----------------------------------------
+  smoke-staging:
+    needs: deploy-staging
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: staging
+    steps:
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Smoke — readiness probe /api/auth/setup-status
+        run: |
+          FQDN="$(az containerapp show --name ca-voicebot-staging-runtime --resource-group rg-voicebot-staging --query properties.configuration.ingress.fqdn -o tsv)"
+          echo "staging runtime: ${FQDN}"
+          code="$(curl -sS -o /dev/null -w '%{http_code}' "https://${FQDN}/api/auth/setup-status")"
+          [ "${code}" = "200" ] || { echo "::error::readiness probe returned ${code}, expected 200"; exit 1; }
+
+      - name: Smoke — Twilio signature layer rejects unsigned webhook (403 pinned)
+        run: |
+          FQDN="$(az containerapp show --name ca-voicebot-staging-runtime --resource-group rg-voicebot-staging --query properties.configuration.ingress.fqdn -o tsv)"
+          code="$(curl -sS -o /dev/null -w '%{http_code}' -X POST "https://${FQDN}/twilio/incoming-call" --data 'CallSid=ci-smoke&From=%2B10000000000&To=%2B10000000001')"
+          [ "${code}" = "403" ] || { echo "::error::unsigned webhook returned ${code}, expected 403 (pinned contract, product-impact §2.3)"; exit 1; }
+
+      # §12 step 5 explicitly includes REAL TELEPHONE smoke tests. Those need a
+      # live Twilio number and a human/scripted PSTN call — they cannot run in
+      # GitHub Actions (gap G-2). This checklist gates the prod approval.
+      - name: Manual telephone smoke checklist (required before prod approval)
+        run: |
+          cat <<'EOF'
+          MANUAL — real telephone smoke (spec §12 step 5; gate for the prod approval):
+            [ ] place a real PSTN call to the staging Twilio number
+            [ ] complete a short conversation in each business language (A-3: zh-HK, zh-CN, en-US, ja-JP)
+            [ ] verify barge-in interrupts TTS cleanly (§6.3)
+            [ ] verify summary lands in history after hang-up (postcall worker, §2.2)
+            [ ] verify status callbacks arrive (§6.1.8)
+          Record results in the release notes before approving the prod deployment.
+          EOF
+
+  # ---- §12 steps 6-8: approval gate + green release ----------------------
+  # Step 6 IS this job's GitHub Environment: 'prod' must carry required
+  # reviewers — approving this deployment is the production approval.
+  release-prod:
+    needs: [build, smoke-staging]
+    if: ${{ inputs.deploy_prod }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    environment: prod
+    env:
+      DIGEST: ${{ needs.build.outputs.digest }}
+      APP_RUNTIME: ca-voicebot-prod-runtime
+      APP_WORKER: ca-voicebot-prod-worker
+      RG: rg-voicebot-prod
+      COSMOS_ENDPOINT: https://cosmos-voicebot-prod.documents.azure.com:443/
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      # §12 step 4, prod half — read-only. Prod infrastructure is never applied
+      # by this workflow (spec §12 final note).
+      - name: "§12-4 Bicep what-if (prod, read-only)"
+        run: |
+          sed -i.bak "s#^param containerImage = .*#param containerImage = '${ACR_PROD}.azurecr.io/voicebot@${DIGEST}'#" infra/bicep/params/prod.bicepparam
+          bash scripts/deploy/deploy-azure.sh prod
+
+      # §12 step 3 promotion: same bytes, same digest, different registry.
+      - name: Promote image by digest (acr import — never rebuild)
+        run: |
+          az acr import --name "${ACR_PROD}" --source "${ACR_STAGING}.azurecr.io/voicebot@${DIGEST}" --image "voicebot:${GITHUB_SHA}"
+          GOT="$(az acr repository show --name "${ACR_PROD}" --image "voicebot:${GITHUB_SHA}" --query digest -o tsv)"
+          [ "${GOT}" = "${DIGEST}" ] || { echo "::error::digest drift on import: ${GOT} != ${DIGEST}"; exit 1; }
+
+      # §12 step 7 part 1 (blue-green-release.md §2.1 / §8): green takes 0%.
+      - name: "§12-7 Green deploy — pin admission to blue, create green at 0%"
+        run: |
+          BLUE="$(az containerapp show --name "${APP_RUNTIME}" --resource-group "${RG}" --query properties.latestRevisionName -o tsv)"
+          [ -n "${BLUE}" ] || { echo "::error::cannot resolve current (blue) revision"; exit 1; }
+          echo "blue revision: ${BLUE}"
+          # Pin traffic explicitly so the new revision is created at 0%.
+          az containerapp ingress traffic set --name "${APP_RUNTIME}" --resource-group "${RG}" --revision-weight "${BLUE}=100"
+          az containerapp update --name "${APP_RUNTIME}" --resource-group "${RG}" \
+            --image "${ACR_PROD}.azurecr.io/voicebot@${DIGEST}" --revision-suffix "g${GITHUB_SHA::12}"
+          GREEN="$(az containerapp show --name "${APP_RUNTIME}" --resource-group "${RG}" --query properties.latestRevisionName -o tsv)"
+          [ "${GREEN}" != "${BLUE}" ] || { echo "::error::green revision was not created"; exit 1; }
+          echo "green revision: ${GREEN} (weight 0)"
+          echo "BLUE=${BLUE}" >> "$GITHUB_ENV"
+          echo "GREEN=${GREEN}" >> "$GITHUB_ENV"
+
+      # The worker has no media endpoint and no blue/green requirement — its
+      # jobs are idempotent (U-304), so an ordinary revision roll is correct.
+      - name: Update worker revision (ordinary roll)
+        run: |
+          az containerapp update --name "${APP_WORKER}" --resource-group "${RG}" --image "${ACR_PROD}.azurecr.io/voicebot@${DIGEST}"
+
+      - name: "§12-7 Assert green=0 blue=100 before readiness"
+        run: |
+          az containerapp show --name "${APP_RUNTIME}" --resource-group "${RG}" --query properties.configuration.ingress.traffic -o json
+          echo "green must show weight 0; blue 100 — asserted below"
+          TRAFFIC="$(az containerapp show --name "${APP_RUNTIME}" --resource-group "${RG}" --query properties.configuration.ingress.traffic -o json)"
+          echo "${TRAFFIC}" | grep -q "\"revisionName\": \"${GREEN}\"" || { echo "::error::green not in traffic table"; exit 1; }
+          echo "${TRAFFIC}" | grep -q "\"revisionName\": \"${BLUE}\"" || { echo "::error::blue not in traffic table"; exit 1; }
+
+      - name: "§12-7 Readiness — green probe /api/auth/setup-status"
+        run: |
+          GFQDN="$(az containerapp revision show --name "${APP_RUNTIME}" --resource-group "${RG}" --revision "${GREEN}" --query properties.fqdn -o tsv)"
+          echo "green endpoint: https://${GFQDN}"
+          for i in $(seq 1 30); do
+            code="$(curl -sS -o /dev/null -w '%{http_code}' "https://${GFQDN}/api/auth/setup-status" || true)"
+            echo "probe ${i}: ${code}"
+            [ "${code}" = "200" ] && exit 0
+            sleep 10
+          done
+          echo "::error::green readiness probe never returned 200 (blue-green-release.md D1: stay on blue)"
+          exit 1
+
+      # THE routing switch — the only traffic mutation in the whole pipeline.
+      - name: "§12-7 Routing switch (green=100, blue=0)"
+        run: |
+          az containerapp ingress traffic set --name "${APP_RUNTIME}" --resource-group "${RG}" --revision-weight "${GREEN}=100" "${BLUE}=0"
+          echo "SWITCHED=1" >> "$GITHUB_ENV"
+
+      # §12 step 8 part 1 — drain, hold for the watch window (no retire yet).
+      # Exit 2 = deadline with live leases -> operator decision (forced-drain is
+      # human-only, blue-green-release.md §6); job fails WITHOUT rollback.
+      - name: "§12-8 Drain blue (FC-7 lease census to zero)"
+        run: |
+          bash scripts/deploy/drain-runtime.sh prod "${BLUE}" --apply --deadline "${{ inputs.drain_deadline_minutes }}"
+        env:
+          COSMOS_ENDPOINT: ${{ env.COSMOS_ENDPOINT }}
+          COSMOS_DATABASE: ${{ env.COSMOS_DATABASE }}
+
+      # §12 step 8 part 2 — watch; the window is the rollback runway (§7).
+      - name: "§12-8 Watch window (regression -> rollback)"
+        run: |
+          END=$(($(date +%s) + ${{ inputs.watch_minutes }} * 60))
+          GFQDN="$(az containerapp revision show --name "${APP_RUNTIME}" --resource-group "${RG}" --revision "${GREEN}" --query properties.fqdn -o tsv)"
+          while [ "$(date +%s)" -lt "${END}" ]; do
+            code="$(curl -sS -o /dev/null -w '%{http_code}' "https://${GFQDN}/api/auth/setup-status" || true)"
+            if [ "${code}" != "200" ]; then
+              echo "REGRESSION=1" >> "$GITHUB_ENV"
+              echo "::error::watch regression: green probe returned ${code}"
+              exit 1
+            fi
+            sleep 60
+          done
+          echo "watch window clean"
+
+      - name: "§12-8 Retire blue (drain-complete + clean watch only)"
+        run: |
+          bash scripts/deploy/drain-runtime.sh prod "${BLUE}" --apply --retire-when-drained
+        env:
+          COSMOS_ENDPOINT: ${{ env.COSMOS_ENDPOINT }}
+          COSMOS_DATABASE: ${{ env.COSMOS_DATABASE }}
+
+      # §7 rollback: point new calls back to blue. Runs ONLY on a watch
+      # regression after the switch — never on drain-deadline, never a
+      # teardown. Green then drains with the same tool (roles swapped).
+      - name: "Rollback — flip new calls back to blue (§7)"
+        if: ${{ failure() && env.SWITCHED == '1' && env.REGRESSION == '1' && inputs.rollback_on_regression }}
+        run: |
+          az containerapp ingress traffic set --name "${APP_RUNTIME}" --resource-group "${RG}" --revision-weight "${BLUE}=100" "${GREEN}=0"
+          echo "new calls are back on ${BLUE}; green is draining at 0%."
+          echo "Next (operator): scripts/deploy/drain-runtime.sh prod ${GREEN} --apply --retire-when-drained"
+          bash scripts/deploy/drain-runtime.sh prod "${GREEN}"
+        env:
+          COSMOS_ENDPOINT: ${{ env.COSMOS_ENDPOINT }}
+          COSMOS_DATABASE: ${{ env.COSMOS_DATABASE }}

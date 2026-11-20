@@ -836,20 +836,20 @@ def test_patch_demo_engine_voice_provider_persists_and_reads_back(tmp_path, monk
     r = client.patch(
         f"/api/admin/demos/{_FILLER_DEMO_ID}",
         headers=_basic(),
-        json={"engine": "pipeline", "provider": "polly", "voice": "Zhiyu"},
+        json={"engine": "pipeline", "provider": "minimax", "voice": "Cantonese_GentleLady"},
     )
     assert r.status_code == 200, r.text
     demo = bot.DEMO_LOADER.get(_FILLER_DEMO_ID)
     assert demo["engine"] == "pipeline"
-    assert demo["provider"] == "polly"
-    assert demo["voice"] == "Zhiyu"
+    assert demo["provider"] == "minimax"
+    assert demo["voice"] == "Cantonese_GentleLady"
 
     g = client.get(f"/api/admin/demos/{_FILLER_DEMO_ID}", headers=_basic())
     assert g.status_code == 200, g.text
     body = g.json()
     assert body["engine"] == "pipeline"
-    assert body["provider"] == "polly"
-    assert body["voice"] == "Zhiyu"
+    assert body["provider"] == "minimax"
+    assert body["voice"] == "Cantonese_GentleLady"
 
 
 def test_patch_demo_engine_only_not_blocked_by_has_content(tmp_path, monkeypatch):

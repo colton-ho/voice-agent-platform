@@ -114,4 +114,4 @@ def test_minimax_tts_missing_key_names_injection_channel(monkeypatch):
     monkeypatch.delenv("MINIMAX_API_KEY", raising=False)
     monkeypatch.delenv("KEY_VAULT_URL", raising=False)
     with pytest.raises(RuntimeError, match="MINIMAX-API-KEY"):
-        bot._build_tts("minimax", "tiffany", region="us-east-1", frozen=None, aio_session=None)
+        bot._build_tts("minimax", "tiffany", aio_session=None)

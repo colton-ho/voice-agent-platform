@@ -20,6 +20,9 @@ openai==2.54.0
 # 4.17.1 / 7.15.0 = 本环境解析到的最新稳定版，已装入 .venv 验证 import 纯度边界。
 azure-cosmos==4.17.1
 azure-servicebus==7.15.0
+# U-201（Phase C）：Twilio SDK —— FC-8 签名校验首选实现 + U-207 /api/admin/phone-numbers
+# IncomingPhoneNumbers 数据源。twilio_sig.py stdlib HMAC 保留为独立测试预言（A-1 裁决）。
+twilio==9.13.0
 # aioboto3 已移除 — CR-1：与 pipecat-ai==1.4.0 的 aiobotocore<4 约束不可共存，且无运行时引用（G-2），见 docs/azure/dependency-matrix.md
 aiohttp
 python-dotenv

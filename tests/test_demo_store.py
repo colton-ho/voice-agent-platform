@@ -149,11 +149,22 @@ def test_put_get_list_roundtrip_with_tool_ids_and_decimal(fake):
         assert "tools" not in demo
         assert demo["tool_ids"] == ["end_call"]
         # Canonical key set (same as demo_loader.normalize_demo_dict output).
+        # Includes the per-demo override keys (engine/provider/voice/model) and
+        # asr_filter — they are part of the shared normalizer's canonical shape
+        # and MUST round-trip or every DDB read/write drops them (C4 drift fix).
         assert set(demo.keys()) == {
-            "id", "label", "lang", "system", "greeting",
+            "id", "label", "lang",
+            "engine", "provider", "voice", "model",
+            "system", "greeting",
             "kb_intro", "kb_ack", "kb_body", "tool_ids",
-            "mcp_servers", "filler", "tags",
+            "mcp_servers", "filler", "asr_filter", "tags",
         }
+        # Absent in SAMPLE_DEMO -> round-trip as None (never dropped, never "").
+        assert demo["engine"] is None
+        assert demo["provider"] is None
+        assert demo["voice"] is None
+        assert demo["model"] is None
+        assert demo["asr_filter"] is None
         # Per-lang maps survive.
         assert demo["system"]["zh-HK"] == "你係客服"
         assert demo["greeting"]["en-US"] == "hello"

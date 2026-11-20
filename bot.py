@@ -73,11 +73,11 @@ from pipecat.turns.user_stop.speech_timeout_user_turn_stop_strategy import (
 )
 from pipecat.serializers.base_serializer import FrameSerializer
 from pipecat.services.aws.nova_sonic.llm import AWSNovaSonicLLMService
-from pipecat.services.aws.stt import AWSTranscribeSTTService
+from pipecat.services.aws.stt import AWSTranscribeSTTService  # legacy: ASR test page only
 from pipecat.services.llm_service import LLMService
 from pipecat.services.minimax.tts import MiniMaxHttpTTSService, MiniMaxTTSSettings
 from pipecat.services.tts_service import TTSService
-from pipecat.services.settings import LLMSettings, TTSSettings
+from pipecat.services.settings import LLMSettings
 from pipecat.frames.frames import ErrorFrame, TTSAudioRawFrame
 from pipecat.utils.tracing.service_decorators import traced_tts
 from asr_filter import (
@@ -86,11 +86,10 @@ from asr_filter import (
     _env_float,
     _env_int,
 )
-from asr_multilang import build_transcribe_presigned_url
+from asr_multilang import build_transcribe_presigned_url  # legacy: AWS-only test tool
 from timeout_filler import TimeoutFillerObserver
 from tool_filler import with_filler
 from collections.abc import AsyncGenerator
-from dataclasses import dataclass
 import json as _mm_json
 from pipecat.transcriptions.language import Language
 from pipecat.transports.websocket.fastapi import (
@@ -103,8 +102,11 @@ from providers.llm.azure_openai import make_managed_llm
 from demo_store import DemoStore
 from voice_store import VoiceStore
 from activity_store import ActivityStore
+from storage.base import CallEvent, CallFinalizedError, CallRecord, CallState
 from storage.cosmos_calls import CosmosCallRepository
 import twilio_sig  # X-Twilio-Signature verification (T1; stdlib-only)
+from providers.telephony import twilio_adapter  # FC-8 signature seam (U-205; A-1)
+from providers.telephony.twilio_stream import StreamSessionDirectory  # U-202 registry (U-205 gate)
 from latency_observer import LatencyObserver  # pure-observation latency (T1/T2)
 
 load_dotenv(override=True)
@@ -779,95 +781,6 @@ class SimpleMiniMaxTTSService(MiniMaxHttpTTSService):
             yield ErrorFrame(error=f"MiniMax stream failed: {e}")
             return
 
-# ---- Minimal AWS Polly TTS service -------------------------------------
-# Pipecat's bundled AWSPollyTTSService was not yielding audio frames in our
-# pipeline (run_tts started but never reached yield; resampler interaction
-# suspected). This thin replacement calls Polly directly, streams PCM out
-# at Polly's native rate, and lets downstream transport handle playback.
-
-
-@dataclass
-class _PollyTTSSettings(TTSSettings):
-    engine: str | None = None
-
-
-class SimplePollyTTSService(TTSService):
-    """Minimal Polly TTS. Skips SSML/resample — outputs native 16 kHz PCM16."""
-
-    Settings = _PollyTTSSettings
-    _settings: Settings
-
-    POLLY_SAMPLE_RATE = 16000  # Polly neural PCM is 16 kHz
-
-    def __init__(
-        self,
-        *,
-        voice: str,
-        engine: str = "neural",
-        region: str,
-        aws_access_key_id: str | None = None,
-        aws_secret_access_key: str | None = None,
-        aws_session_token: str | None = None,
-        sample_rate: int | None = None,
-        **kwargs,
-    ):
-        super().__init__(
-            sample_rate=sample_rate,
-            push_start_frame=True,
-            push_stop_frames=True,
-            settings=self.Settings(model=None, voice=voice, engine=engine),
-            **kwargs,
-        )
-        self._aws_kwargs = {
-            "aws_access_key_id": aws_access_key_id,
-            "aws_secret_access_key": aws_secret_access_key,
-            "aws_session_token": aws_session_token,
-            "region_name": region,
-        }
-        self._aws_session = aioboto3.Session()
-
-    def can_generate_metrics(self) -> bool:
-        return True
-
-    @traced_tts
-    async def run_tts(self, text: str, context_id: str) -> AsyncGenerator:
-        logger.debug(f"{self}: Polly synth [{text}]")
-        try:
-            async with self._aws_session.client("polly", **self._aws_kwargs) as polly:
-                resp = await polly.synthesize_speech(
-                    Text=text,
-                    TextType="text",
-                    OutputFormat="pcm",
-                    VoiceId=self._settings.voice,
-                    Engine=self._settings.engine,
-                    SampleRate=str(self.POLLY_SAMPLE_RATE),
-                )
-                pcm = await resp["AudioStream"].read()
-
-            if not pcm:
-                yield ErrorFrame(error="Polly returned empty audio")
-                return
-
-            await self.start_tts_usage_metrics(text)
-
-            # Emit in 20ms chunks at Polly's native rate. Transport will resample
-            # to self.sample_rate via its own audio pipeline.
-            chunk_bytes = 640  # 20ms @ 16kHz PCM16 mono
-            for i in range(0, len(pcm), chunk_bytes):
-                await self.stop_ttfb_metrics()
-                yield TTSAudioRawFrame(
-                    audio=pcm[i : i + chunk_bytes],
-                    sample_rate=self.POLLY_SAMPLE_RATE,
-                    num_channels=1,
-                    context_id=context_id,
-                )
-        except Exception as e:
-            logger.exception("Polly TTS failed")
-            yield ErrorFrame(error=f"Polly TTS error: {e}")
-        finally:
-            await self.stop_ttfb_metrics()
-
-
 # Polly voices, sourced from
 # https://docs.aws.amazon.com/polly/latest/dg/available-voices.html
 # Each entry: label, gender, language (matches our LANGUAGES keys), engine.
@@ -903,7 +816,7 @@ POLLY_VOICES: dict[str, dict] = {
 }
 DEFAULT_POLLY_VOICE = "Zhiyu"
 
-TTS_PROVIDERS = {"minimax": "MiniMax", "polly": "AWS Polly"}
+TTS_PROVIDERS = {"minimax": "MiniMax"}
 DEFAULT_PROVIDER = "minimax"
 
 # MiniMax TTS models. Newer "speech-2.x-turbo" gives better quality and is the
@@ -1268,10 +1181,23 @@ HISTORY_BUFFERS: dict[str, list[dict]] = {}
 PHONE_TOOLS_ENABLED = os.environ.get("PHONE_TOOLS_ENABLED", "1").strip() not in ("", "0", "false", "False")
 
 
-def _summary_job(call_id: str) -> dict:
+def _summary_job(call_id: str, lang_key: str = "", model_key: str = "") -> dict:
     """§2.2 job 信封（MessageId=job_id 由發佈方 set）：job_type 判別，
-    summary 現在；approved artifacts 未來同隊列（F8 最小集）。"""
-    return {"job_type": "summary", "job_id": f"summary:{call_id}", "call_id": call_id}
+    summary 現在；approved artifacts 未來同隊列（F8 最小集）。
+
+    U-304：信封带 lang_key/model_key——即 _invoke_summary_bedrock 的调用上下文
+    （与 /api/summary 的传参同形，见其 model_key 取用处）。turns 不入信封：以
+    call_id 为引用，worker 经 repo.get_history_doc 由 transcripts/call_events
+    重拼（信封保持小、不在消息体里复制转写）。缺省空串由 worker/被调方回落
+    DEFAULT_*，旧信封（仅三字段）重放时同样安全。
+    """
+    return {
+        "job_type": "summary",
+        "job_id": f"summary:{call_id}",
+        "call_id": call_id,
+        "lang_key": lang_key or "",
+        "model_key": model_key or "",
+    }
 
 
 def _servicebus_sink():
@@ -1436,7 +1362,8 @@ class HistoryRecorder:
         sink = self._summary_sink if self._summary_sink is not None else _servicebus_sink()
         if sink is not None:
             try:
-                sink(_summary_job(call_id))
+                # U-304：lang_key/model_key 随信封快照（发佈时的调用上下文）。
+                sink(_summary_job(call_id, meta.get("lang") or "", meta.get("model") or ""))
             except Exception:
                 logger.exception(f"summary job enqueue failed for {call_id}")
             return
@@ -1446,10 +1373,13 @@ class HistoryRecorder:
         self, call_id: str, turns: list[dict], meta: dict
     ) -> None:
         lang = meta.get("lang") or DEFAULT_LANG
+        # U-304：降级腿与 worker 腿同形调用（§2.2「同一受理契约」——两腿
+        # 不得分裂出不同的摘要模型选择）；model_key 缺省回落 DEFAULT_MODEL。
+        model_key = meta.get("model") or DEFAULT_MODEL
         try:
             # 30s 預算：B-3 後移 worker 側原值（§2.2）
             struct = await asyncio.wait_for(
-                _invoke_summary_bedrock(turns, lang), timeout=30.0
+                _invoke_summary_bedrock(turns, lang, model_key=model_key), timeout=30.0
             )
             fields = {"summary": struct, "summary_status": "ok"}
         except Exception as e:
@@ -1796,26 +1726,11 @@ def _build_tts(
     provider: str,
     voice_key: str,
     *,
-    region: str,
-    frozen,
     aio_session: aiohttp.ClientSession,
     minimax_model: str | None = None,
     lang_key: str | None = None,
 ):
     """Return a Pipecat TTS service for the chosen provider."""
-    if provider == "polly":
-        voice_id, engine = _resolve_polly_voice(voice_key)
-        logger.info(f"TTS: Polly voice={voice_id} engine={engine} (simple impl)")
-        return SimplePollyTTSService(
-            voice=voice_id,
-            engine=engine,
-            region=region,
-            aws_access_key_id=frozen.access_key,
-            aws_secret_access_key=frozen.secret_key,
-            aws_session_token=frozen.token,
-            sample_rate=OUTPUT_SAMPLE_RATE,
-        )
-
     voice_id, language_boost = _resolve_minimax_voice(voice_key, lang_key)
     model_id = minimax_model if minimax_model in MINIMAX_MODELS else DEFAULT_MINIMAX_MODEL
     logger.info(f"TTS: MiniMax voice={voice_id} boost={language_boost} model={model_id}")
@@ -2323,12 +2238,17 @@ async def _build_nova_sonic_pipeline(
                 if history_recorder is not None and call_id is not None
                 else None
             )
+            # U-206 §6.4: transfer flow seams (capability-gated — while the
+            # FC-1 supports_transfer flag is off the flow is disabled and the
+            # D-5 record+hangup default is byte-identical).
+            _transfer_flow = _phone_transfer_flow(call_id, history_recorder)
         else:
             # Web scope: no DDB writes, no SIP BYE — handlers must be None
             # so call_control_tools._handle_* skip those side-effects.
             _hist_append = None
             _mark_transfer = None
             _write_outcome = None
+            _transfer_flow = None
         register_call_control_handlers(
             llm, task,
             call_id=call_id or "unknown",
@@ -2337,6 +2257,10 @@ async def _build_nova_sonic_pipeline(
             history_append=_hist_append,
             mark_transfer=_mark_transfer,
             write_outcome=_write_outcome,
+            transfer_flow=_transfer_flow,
+            # §6.4 call-update trigger (U-206 deferral wired): resolved CallSid
+            # → Twilio call-update with <Dial>. None on web scope.
+            start_transfer=_phone_start_transfer(call_id) if call_id else None,
         )
 
     task._aio_session = None  # nothing to close for Nova Sonic
@@ -2470,9 +2394,6 @@ async def _build_pipeline(
         f"minimax_model={minimax_model} in_sr={input_sample_rate} scope={_scope}"
     )
 
-    region = os.environ.get("AWS_REGION", "us-east-1")
-    frozen = boto3.Session(region_name=region).get_credentials().get_frozen_credentials()
-
     serializer = serializer or RawPCMSerializer(input_sample_rate, OUTPUT_SAMPLE_RATE)
     transport = FastAPIWebsocketTransport(
         websocket=websocket,
@@ -2486,29 +2407,37 @@ async def _build_pipeline(
         ),
     )
 
-    stt = AWSTranscribeSTTService(
-        region=region,
-        aws_access_key_id=frozen.access_key,
-        api_key=frozen.secret_key,
-        aws_session_token=frozen.token,
+    # Azure Speech STT (U-101: replaces AWS Transcribe — eliminates active AWS
+    # dependency from the default code path). Lazy import: the Azure Speech SDK
+    # (azure-cognitiveservices-speech) is a runtime dep for the pipeline path
+    # but must NOT break `import bot` when absent.
+    from pipecat.services.azure.stt import AzureSTTService
+
+    speech_key = (os.environ.get("SPEECH_KEY") or "").strip()
+    speech_region = (os.environ.get("SPEECH_REGION") or "").strip()
+    speech_endpoint = (os.environ.get("SPEECH_ENDPOINT") or "").strip()
+
+    stt = AzureSTTService(
+        api_key=speech_key,
+        region=speech_region or None,
+        private_endpoint=speech_endpoint or None,
         sample_rate=input_sample_rate,
-        settings=AWSTranscribeSTTService.Settings(language=lang["stt"]),
+        settings=AzureSTTService.Settings(language=lang["stt"]),
     )
 
-    # LLM 側 MI（裁決 A-3 耦合旗 B5/V4）：無密鑰；STT 側凍結憑證另案（Transcribe
-    # 調用面歸 U-101）。F3/F5/F6（重試預算/caching 能力位/max_tokens 參數名）事實
-    # 源在 FC-3 適配器；max_tokens=256 為 F6 對話原值。
+    # LLM 側 MI（裁決 A-3 耦合旗 B5/V4）：無密鑰。F3/F5/F6（重試預算/caching
+    # 能力位/max_tokens 參數名）事實源在 FC-3 適配器；max_tokens=256 為 F6 對話原值。
     llm = _FC3PipecatLLM(
         llm=make_managed_llm(model=model_id),
         system_instruction=system_prompt,
         max_tokens=256,
     )
 
-    # Always create an aiohttp session; MiniMax uses it, Polly just ignores it.
+    # Always create an aiohttp session; MiniMax uses it.
     aio_session = aiohttp.ClientSession()
     tts = _build_tts(
         provider, voice_key,
-        region=region, frozen=frozen, aio_session=aio_session,
+        aio_session=aio_session,
         minimax_model=minimax_model,
         lang_key=lang_key,
     )
@@ -2758,12 +2687,17 @@ async def _build_pipeline(
                 if history_recorder is not None and call_id is not None
                 else None
             )
+            # U-206 §6.4: transfer flow seams (capability-gated — while the
+            # FC-1 supports_transfer flag is off the flow is disabled and the
+            # D-5 record+hangup default is byte-identical).
+            _transfer_flow = _phone_transfer_flow(call_id, history_recorder)
         else:
             # Web scope: no DDB writes, no SIP BYE — handlers must be None
             # so call_control_tools._handle_* skip those side-effects.
             _hist_append = None
             _mark_transfer = None
             _write_outcome = None
+            _transfer_flow = None
         register_call_control_handlers(
             llm, task,
             call_id=call_id or "unknown",
@@ -2772,6 +2706,10 @@ async def _build_pipeline(
             history_append=_hist_append,
             mark_transfer=_mark_transfer,
             write_outcome=_write_outcome,
+            transfer_flow=_transfer_flow,
+            # §6.4 call-update trigger (U-206 deferral wired): resolved CallSid
+            # → Twilio call-update with <Dial>. None on web scope.
+            start_transfer=_phone_start_transfer(call_id) if call_id else None,
         )
 
     task._aio_session = aio_session  # cleaned up in ws_endpoint finally
@@ -3490,114 +3428,80 @@ async def admin_options(_: dict = Depends(require_admin)) -> dict:
     return _admin_options_payload()
 
 
-# Chime Voice Connector region is fixed: VCs only exist in us-east-1 (see
-# CLAUDE.md). This is independent of BedrockRegion / the deploy region.
-CHIME_REGION = "us-east-1"
+# Admin phone-numbers view data source — U-207 (decision (d) FINAL 2026-11-06):
+# content re-targeted from Amazon Chime (chime-sdk-voice) to Twilio Incoming
+# Phone Numbers. The {voice_connectors, error} envelope and its row field names
+# are PINNED legacy shape (product-impact C-4) — never remove/rename them;
+# content swap only.
+#
+# Row mapping (Chime field → Twilio IncomingPhoneNumber attribute):
+#   voice_connector_id   → sid
+#   voice_connector_name → friendly_name
+#   e164                 → phone_number
+#   status               → status (kept present; None when the attribute is
+#                          absent — Chime status values had no Twilio twin)
+# Chime-only join semantics (per-VC rows, number-less VCs, unassociated
+# numbers) have no Twilio equivalent: one row per Twilio number, same four
+# field names, neutral values (None) where a source attribute is missing.
+
+def _twilio_vc_client():
+    """Build the Twilio REST client for the admin phone-numbers view.
+
+    Injectable seam for tests (monkeypatch ``bot._twilio_vc_client`` — no
+    network in tests). Credentials come from the existing config-contract env
+    vars TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN (no new config keys). The
+    twilio SDK is imported lazily so bot.py still imports when it is absent;
+    any failure degrades via the caller's best-effort envelope."""
+    from twilio.rest import Client
+
+    account_sid = os.environ.get("TWILIO_ACCOUNT_SID", "").strip()
+    auth_token = os.environ.get("TWILIO_AUTH_TOKEN", "").strip()
+    return Client(account_sid, auth_token)
 
 
-def _list_chime_vc_numbers() -> dict:
-    """Return Chime Voice Connectors joined with their associated phone numbers.
+def _list_twilio_vc_numbers() -> dict:
+    """Return Twilio Incoming Phone Numbers as pinned voice_connectors rows.
 
-    READ-ONLY: calls only ``ListVoiceConnectors`` + ``ListPhoneNumbers`` (both
-    paginated). There is no per-VC "list associated numbers" API, so we read all
-    account numbers and join each number's
-    ``Associations[Name=='VoiceConnectorId'].Value`` back to the VC.
+    READ-ONLY: lists only Incoming Phone Numbers
+    (``client.incoming_phone_numbers.list()`` — the documented equivalent of
+    ``client.api.v2010.account.incoming_phone_numbers.list()``; the SDK
+    auto-paginates).
 
-    Shape::
+    Shape (pinned — see mapping table above)::
 
         {"voice_connectors": [
             {"voice_connector_id", "voice_connector_name", "e164", "status"}
          ], "error": None}
 
-    Rows: one per (VC, associated number); a VC with no number → one row with
-    ``e164=None``; a number associated to no VC → one row with both VC fields
-    ``None``. Best-effort: any failure (AccessDenied / timeout / unreachable)
-    returns ``{"voice_connectors": [], "error": "<reason>"}`` with NO exception,
-    so the admin page never 500s on a Chime hiccup or missing IAM permission.
-    """
-    from botocore.config import Config
-
+    Rows: one per Twilio number. Best-effort: any failure (auth / timeout /
+    unreachable / missing SDK) returns
+    ``{"voice_connectors": [], "error": "<reason>"}`` with NO exception, so the
+    admin page never 500s on a Twilio hiccup or missing credentials. The error
+    is ``str(exc)`` only — Twilio exceptions never embed credentials, and
+    nothing from the environment is interpolated into the error text."""
     try:
-        client = boto3.client(
-            "chime-sdk-voice",
-            region_name=CHIME_REGION,
-            config=Config(
-                connect_timeout=3,
-                read_timeout=5,
-                retries={"max_attempts": 2},
-            ),
-        )
-
-        # 1. VCs (paginated) → {id: name}
-        vc_names: dict[str, str] = {}
-        token = None
-        while True:
-            kwargs = {"MaxResults": 99}
-            if token:
-                kwargs["NextToken"] = token
-            resp = client.list_voice_connectors(**kwargs)
-            for vc in resp.get("VoiceConnectors", []):
-                vc_names[vc.get("VoiceConnectorId")] = vc.get("Name")
-            token = resp.get("NextToken")
-            if not token:
-                break
-
-        # 2. Numbers (paginated) → rows joined to their VC.
+        client = _twilio_vc_client()
         rows: list[dict] = []
-        seen_vc_ids: set[str] = set()
-        token = None
-        while True:
-            kwargs = {"MaxResults": 99}
-            if token:
-                kwargs["NextToken"] = token
-            resp = client.list_phone_numbers(**kwargs)
-            for num in resp.get("PhoneNumbers", []):
-                e164 = num.get("E164PhoneNumber")
-                status = num.get("Status")
-                vc_id = None
-                for assoc in num.get("Associations", []):
-                    if assoc.get("Name") == "VoiceConnectorId":
-                        vc_id = assoc.get("Value")
-                        break
-                if vc_id is not None:
-                    seen_vc_ids.add(vc_id)
-                rows.append(
-                    {
-                        "voice_connector_id": vc_id,
-                        # name resolved from the VC list; unknown/absent → None
-                        "voice_connector_name": vc_names.get(vc_id) if vc_id else None,
-                        "e164": e164,
-                        "status": status,
-                    }
-                )
-            token = resp.get("NextToken")
-            if not token:
-                break
-
-        # 3. Also surface VCs that have NO associated number, so the admin can
-        #    see a VC exists but isn't wired to a number yet.
-        for vc_id, name in vc_names.items():
-            if vc_id not in seen_vc_ids:
-                rows.append(
-                    {
-                        "voice_connector_id": vc_id,
-                        "voice_connector_name": name,
-                        "e164": None,
-                        "status": None,
-                    }
-                )
-
+        for num in client.incoming_phone_numbers.list():
+            rows.append(
+                {
+                    "voice_connector_id": getattr(num, "sid", None),
+                    "voice_connector_name": getattr(num, "friendly_name", None),
+                    "e164": getattr(num, "phone_number", None),
+                    "status": getattr(num, "status", None),
+                }
+            )
         return {"voice_connectors": rows, "error": None}
     except Exception as e:  # noqa: BLE001 — best-effort: never 500 the admin page
-        logger.warning(f"_list_chime_vc_numbers failed (degraded to empty): {e}")
+        logger.warning(f"_list_twilio_vc_numbers failed (degraded to empty): {e}")
         return {"voice_connectors": [], "error": str(e)}
 
 
 @app.get("/api/admin/phone-numbers")
 async def admin_phone_numbers(_: dict = Depends(require_admin)) -> dict:
-    """Admin-only, read-only view of Chime Voice Connector ↔ phone-number
-    associations (real-time from chime-sdk-voice). See _list_chime_vc_numbers."""
-    return _list_chime_vc_numbers()
+    """Admin-only, read-only phone-number inventory (real-time from Twilio
+    Incoming Phone Numbers). See _list_twilio_vc_numbers."""
+    return _list_twilio_vc_numbers()
 
 
 @app.get("/api/admin/metrics")
@@ -4079,13 +3983,14 @@ async def admin_resummarize_history(call_id: str, _: dict = Depends(require_admi
     sink = _servicebus_sink()
     try:
         if sink is not None:
-            sink(_summary_job(call_id))
+            # U-304：lang_key/model_key 取行内快照（重摘要沿用该通呼叫的调用上下文）。
+            sink(_summary_job(call_id, item.get("lang") or "", item.get("model") or ""))
         else:
             # 降級腿複用 HistoryRecorder 的終態落庫路徑（_history 已在上文 404 守衛非 None）
             asyncio.create_task(
                 _history._summarize_and_update(
                     call_id, item.get("turns") or [],
-                    {"lang": item.get("lang") or ""},
+                    {"lang": item.get("lang") or "", "model": item.get("model") or ""},
                 )
             )
     except Exception as e:
@@ -6039,6 +5944,10 @@ async def ws_endpoint(websocket: WebSocket) -> None:
 # multi-language code-switching zh-HK+en-US (B) on identical audio, BEFORE any
 # prod call path changes. Nothing is persisted; no transcripts are logged.
 # A single git revert removes this block + the frontend page cleanly.
+#
+# legacy: AWS-only test tool — will be retired at Azure cutover. The
+# multi-language logic is Transcribe-specific (presigned-URL seam-patch for
+# identify-multiple-languages) and has no direct Azure equivalent in this form.
 
 # The pipecat version our multi-language seam-patch (below) is validated
 # against. CFN UserData pins pipecat-ai to this exact version. If the installed
@@ -6049,6 +5958,10 @@ PINNED_PIPECAT = "1.4.0"
 
 class _MultiLangTranscribeSTT(AWSTranscribeSTTService):
     """Stock-pipecat-compatible multi-language Transcribe STT for stream B.
+
+    legacy: AWS Transcribe-specific multi-language wrapper. The seam-patch
+    approach (monkeypatching get_presigned_url for identify-multiple-languages)
+    has no direct Azure equivalent. Will be retired at Azure cutover.
 
     Stock ``AWSTranscribeSTTService`` (PyPI ``pipecat-ai``) only supports a
     single fixed ``language``; its ``Settings`` has NO identify-* fields. To get
@@ -6990,6 +6903,81 @@ def _twilio_public_host(public_base: str) -> str:
     return host.rstrip("/")
 
 
+# --- U-205: §6.1.9 fallback TwiML + §6.1.8 status callbacks -----------------
+# Two additive surfaces (gap G-9 / C-6), pinned contracts untouched:
+#   * fallback TwiML served when the media stream cannot start (stream-setup
+#     failure: missing stream config / reservation refusal);
+#   * signed status-callback endpoint with persist-before-ack + retry dedup.
+
+# Approved fallback copy (§6.1.9 / C-6) — same message as the adapter's
+# trailing <Say> (providers/telephony/twilio_adapter._FALLBACK_SAY) so the
+# caller hears one consistent message whether the stream dies after connect
+# or setup fails before it.
+_TWILIO_FALLBACK_SAY = (
+    "Sorry, we are unable to connect your call right now. Please try again later."
+)
+
+
+def _twilio_fallback_twiml() -> str:
+    """§6.1.9 approved fallback TwiML: ``<Say>`` + ``<Hangup>``.
+
+    A transfer target (``<Dial>``) is deliberately NOT wired: config_contract.py
+    (spec §11) has no fallback/transfer number key and U-205 must not add config
+    keys — documented gap: a transfer target needs a config addition later.
+    Style reference: ``providers.telephony.twilio_adapter.build_twiml_connect_stream``.
+    """
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        "<Response>"
+        f"<Say>{saxutils.escape(_TWILIO_FALLBACK_SAY)}</Say>"
+        "<Hangup/>"
+        "</Response>"
+    )
+
+
+# U-202 stream-reservation registry (providers/telephony/twilio_stream): the
+# webhook-time reservation record lives here (§6.1.5); the WS accept path binds
+# stream_sid against it. Single instance per process.
+_TWILIO_STREAMS = StreamSessionDirectory()
+
+
+def _twilio_reserve_stream(call_sid: str, account_sid: str) -> bool:
+    """§6.1.5 stream-reservation seam. False → the stream must not start and    the §6.1.9 fallback TwiML is served instead of ``<Connect><Stream>``.
+
+    Injectable for tests (monkeypatch ``bot._twilio_reserve_stream``). The
+    default reserves through U-202's ``StreamSessionDirectory`` (reservation
+    record created at webhook); any refusal/exception is a reservation failure.
+    ``reserve()`` is permissive today (refusal is enforced at WS ``accept``), so
+    the production trigger is a reservation error or a stricter admission
+    implementation (FC-7 ``CapacityExceededError`` per MAX_CONCURRENT_CALLS_
+    PER_REPLICA, U-305) swapped in behind this seam.
+    """
+    try:
+        _TWILIO_STREAMS.reserve(call_sid, account_sid)
+    except Exception as e:
+        logger.warning(f"twilio stream reservation failed for {call_sid}: {e}")
+        return False
+    return True
+
+
+def _twilio_stream_ready(post_params: dict, cfg: dict) -> bool:
+    """§6.1.5/§6.1.9 stream-setup gate for the voice webhook.
+
+    Returns False when the media stream cannot start:
+      1. missing stream config — no Twilio-visible public host means no ``wss://``
+         Stream URL can be built (defensive: the ``enabled`` gate normally         catches this earlier as the pinned 503);
+      2. reservation failure — see ``_twilio_reserve_stream``.
+    False → the webhook answers with the approved fallback TwiML (§6.1.9).
+    """
+    if not _twilio_public_host(cfg.get("public_base") or ""):
+        logger.warning("twilio stream setup: missing stream config (no public host)")
+        return False
+    return _twilio_reserve_stream(
+        (post_params.get("CallSid") or "").strip(),
+        (post_params.get("AccountSid") or cfg.get("account_sid") or "").strip(),
+    )
+
+
 @app.post("/twilio/incoming-call")
 async def twilio_incoming_call(request: Request) -> Response:
     """Twilio voice webhook. Verifies X-Twilio-Signature, returns Connect/Stream
@@ -7024,6 +7012,18 @@ async def twilio_incoming_call(request: Request) -> Response:
             content="invalid signature", status_code=403, media_type="text/plain"
         )
 
+    # §6.1.9 (C-6, U-205): when the media stream cannot start (stream setup
+    # fails — missing stream config / reservation failure) answer with the
+    # approved fallback TwiML instead of pointing Twilio at a stream that can't
+    # establish. The pinned 503/403 contracts and the happy-path TwiML are
+    # untouched (product-impact §2.3).
+    if not _twilio_stream_ready(post_params, cfg):
+        logger.warning(
+            "twilio incoming-call: stream cannot start, serving fallback TwiML "
+            f"call_sid={post_params.get('CallSid', '')}"
+        )
+        return Response(content=_twilio_fallback_twiml(), media_type="text/xml")
+
     caller = post_params.get("From", "")
     public_host = _twilio_public_host(cfg["public_base"])
     caller_attr = saxutils.quoteattr(caller)  # safe XML attribute quoting
@@ -7035,6 +7035,682 @@ async def twilio_incoming_call(request: Request) -> Response:
         "</Stream></Connect></Response>"
     )
     return Response(content=twiml, media_type="text/xml")
+
+
+# --- U-205: signed status callbacks (spec §6.1.8) ---------------------------
+# Twilio POSTs call-status transitions (initiated/ringing/in-progress/completed/
+# failed/busy/no-answer) here. Wire contract (mirrors the /twilio/incoming-call
+# conventions; product-impact §2.3 pins those, this endpoint is additive G-9):
+#   503  Twilio integration not configured (same gate)
+#   403  missing/invalid X-Twilio-Signature — FC-8 seam (decision A-1)
+#   200  event durably persisted, OR deliberately dropped (see below)
+#   5xx  persistence failure → Twilio retries (persist-before-ack: we never
+#        ack an unpersisted event; redeliveries dedup to a single append via
+#        the deterministic event_id)
+# Deliberate 200-drops — a retry can never help, so ack and let Twilio stop:
+#   * event for a finalized call (CallFinalizedError): late events must never
+#     revive a finalized call (U-301 finalize semantics);
+#   * malformed payload without CallSid: nothing to key the event on.
+
+# Whitelisted status-callback fields persisted in CallEvent.payload (§9.1:
+# sanitized — no audio, no credentials; phone numbers are business data,
+# consistent with the history rows' ``caller`` column).
+_STATUS_EVENT_KEYS = (
+    "CallStatus", "Direction", "From", "To",
+    "Timestamp", "SequenceNumber", "CallDuration", "SipResponseCode",
+)
+
+
+def _status_call_repo():
+    """CallRepository seam for status callbacks (tests monkeypatch this).
+
+    Fresh per request (same convention as ``_twilio_config``) so the bot starts
+    unconfigured and storage can be swapped without a restart."""
+    return CosmosCallRepository(ttl_days=HISTORY_TTL_DAYS)
+
+
+def _twilio_status_event_id(call_sid: str, call_status: str, params: dict) -> str:
+    """Deterministic event_id derived from (CallSid, CallStatus, Timestamp/SequenceNumber).
+
+    Twilio retry redeliveries repeat the same POST body → same event_id → the    repo's event_id dedup (R-A-007) collapses them to a single append.
+    SequenceNumber (Twilio's per-call monotonic sequence) is preferred;
+    Timestamp is the fallback; a payload with neither collapses to ``:0``
+    (same-status duplicates are retries — correct to dedup). ``:`` separators:
+    Cosmos ids must not contain ``/ \\ ? #``.
+    """
+    seq = (params.get("SequenceNumber") or params.get("Timestamp") or "").strip()
+    return f"{call_sid}:{call_status or 'unknown'}:{seq or '0'}"
+
+
+def _twilio_status_occurred_at(params: dict):
+    """Parse Twilio's ``Timestamp`` (ISO 8601, with epoch fallback) else now."""
+    raw = (params.get("Timestamp") or "").strip()
+    if raw:
+        try:
+            return datetime.fromisoformat(raw)
+        except ValueError:
+            pass
+        try:
+            return datetime.fromtimestamp(float(raw), tz=timezone.utc)
+        except (ValueError, OSError):
+            pass
+    return datetime.now(tz=timezone.utc)
+
+
+async def _persist_twilio_status_event(params: dict) -> str:
+    """Persist one status event per §6.1.8 persist-before-ack + retry dedup.
+
+    Returns ``"persisted"``, ``"deduplicated"`` (event_id already appended) or
+    ``"dropped-finalized"`` (call already finalized — dropped, never revived).
+    Raises on persistence failure (caller maps to 5xx so Twilio retries).
+
+    Unknown-CallSid policy (U-205 decision — ORPHAN PERSIST, not drop):
+    ``append_events`` needs an existing call row (FC-6 raises ``KeyError``
+    otherwise) and there is no orphan-event home in the frozen contract, so the
+    event's home is a minimal RECEIVED-state call record (spec §8.1's initial
+    state) keyed by CallSid with ``provider_ids.twilio_call_sid`` — the
+    CallRecord contract's own correlation slot. Rationale: §6.1.8 requires the
+    durable trail before acking and calls that fail before any stream exists
+    (busy/no-answer/failed) would otherwise lose every event. ``create()`` is
+    idempotent on conflict and event_id dedup keeps retries to one append.
+    """
+    call_sid = (params.get("CallSid") or "").strip()
+    call_status = (params.get("CallStatus") or "").strip() or "unknown"
+    event = CallEvent(
+        event_id=_twilio_status_event_id(call_sid, call_status, params),
+        call_id=call_sid,
+        event_type=call_status,
+        occurred_at=_twilio_status_occurred_at(params),
+        payload={k: params[k] for k in _STATUS_EVENT_KEYS if params.get(k)},
+    )
+    repo = _status_call_repo()
+    try:
+        try:
+            appended = await repo.append_events(call_sid, [event])
+        except KeyError:
+            # Unknown CallSid → orphan persist (policy documented above).
+            await repo.create(
+                CallRecord(
+                    call_id=call_sid,
+                    state=CallState.RECEIVED,
+                    started_at=event.occurred_at,
+                    provider_ids={"twilio_call_sid": call_sid},
+                )
+            )
+            appended = await repo.append_events(call_sid, [event])
+    except CallFinalizedError:
+        return "dropped-finalized"
+    return "persisted" if appended else "deduplicated"
+
+
+@app.post("/twilio/status-callback")
+async def twilio_status_callback(request: Request) -> Response:
+    """Twilio call-status webhook (spec §6.1.8): signed status callbacks with
+    persist-before-ack + retry dedup.
+
+    Contract (mirrors the /twilio/incoming-call conventions): 503 when Twilio
+    is not configured; 403 on a missing/invalid X-Twilio-Signature (validated
+    through the FC-8 seam providers/telephony/twilio_adapter — SDK-with-stdlib
+    fallback per decision A-1, against the Twilio-visible external URL); 200
+    once the event is durably persisted or deliberately dropped; 5xx on
+    persistence failure so Twilio retries — the deterministic event_id dedups
+    redeliveries to a single append. See ``_persist_twilio_status_event`` for    the unknown-CallSid / finalized-call drop rules.
+    """
+    cfg = _twilio_config()
+    if not cfg["enabled"]:
+        return Response(
+            content="Twilio integration not configured",
+            status_code=503,
+            media_type="text/plain",
+        )
+
+    # full_url MUST be the external URL Twilio actually signed (public base +
+    # path + original raw query) — same canonical rule as incoming-call.
+    raw_query = request.url.query or ""
+    full_url = twilio_sig.build_signed_url(
+        cfg["public_base"], request.url.path, raw_query
+    )
+    form = await request.form()
+    post_params = {k: str(v) for k, v in form.items()}
+    header_sig = request.headers.get("X-Twilio-Signature", "")
+
+    if not twilio_adapter.validate_incoming_call(
+        twilio_adapter.TwilioConfig(
+            auth_token=cfg["auth_token"],
+            public_base_url=cfg["public_base"],
+            account_sid=cfg["account_sid"] or None,
+        ),
+        header_sig,
+        full_url,
+        post_params,
+    ):
+        logger.warning("twilio status-callback rejected: bad signature")
+        return Response(
+            content="invalid signature", status_code=403, media_type="text/plain"
+        )
+
+    if not (post_params.get("CallSid") or "").strip():
+        # Permanently unpersistable (no dedup/correlation key): a retry can
+        # never succeed, so ack and drop rather than burn Twilio's retry budget.
+        logger.warning("twilio status-callback without CallSid: dropped")
+        return Response(content="", status_code=200, media_type="text/plain")
+
+    try:
+        outcome = await _persist_twilio_status_event(post_params)
+    except Exception:
+        # Persist-before-ack: never ack an unpersisted event → 5xx, Twilio
+        # redelivers and the deterministic event_id keeps it a single append.
+        logger.exception("twilio status-callback persistence failed")
+        return Response(
+            content="call event persistence failed", status_code=500,
+            media_type="text/plain",
+        )
+
+    # §8.1: mirror the provider status onto the live machine (observational —
+    # the persisted CallRepository row remains authoritative for state).
+    _machine_apply_status(
+        (post_params.get("CallSid") or "").strip(),
+        post_params.get("CallStatus") or "",
+    )
+
+    logger.info(
+        f"twilio status-callback: {outcome} "
+        f"call_sid={post_params.get('CallSid', '')} "
+        f"status={post_params.get('CallStatus', '')}"
+    )
+    return Response(content="", status_code=200, media_type="text/plain")
+
+
+# --- U-206: §6.4 human handoff (decision D-5 gated; A-2 FINAL) -------------
+# In-repo transfer flows REPLACE the external "Connect Flow Lambda" (A-2
+# FINAL); the Lambda retires at cutover. Two additive surfaces:
+#   * /twilio/transfer-result — <Dial action> outcome endpoint: records the
+#     transfer outcome durably (deterministic event_id → duplicate callbacks
+#     dedup to a single append) and serves the per-status <Say>+<Hangup>
+#     fallback — busy/no-answer/failure never drop the caller (R-P-005);
+#   * _phone_transfer_flow — wires the TransferFlow seams at the pipeline
+#     handoff path (capability flag, transfer-state recording, action URL).
+# The D-5 record+hangup default (transfer_requested + transfer_topic written
+# before teardown) is preserved unchanged — see call_control_tools.
+
+# Transfer-outcome event payload whitelist (§9.1 sanitized — no audio, no
+# credentials; phone numbers are business data, same as _STATUS_EVENT_KEYS).
+_TRANSFER_EVENT_KEYS = (
+    "CallSid", "DialCallSid", "DialCallStatus", "From", "To",
+    "Timestamp", "SequenceNumber", "SipResponseCode",
+)
+
+
+def _phone_telephony_adapter():
+    """FC-1 telephony adapter for the phone leg (U-206 capability seam).
+
+    The §6.4 transfer path is gated by the frozen capability flag
+    ``TelephonyAdapter.supports_transfer`` (providers/base.py:95, decision
+    D-5/G-5) — the flag READS FROM HERE at handoff-wiring time. Returns None
+    until the FC-1 adapter switch lands on the phone path (U-201), so the
+    gate is closed and the D-5 record+hangup default stays byte-identical.
+    Injectable for tests (monkeypatch ``bot._phone_telephony_adapter``).
+    """
+    return None
+
+
+def _phone_transfer_flow(call_id: str | None, history_recorder):
+    """§6.4 transfer flow for the phone handoff path (U-206 wiring seam).
+
+    Capability flag from ``_phone_telephony_adapter()`` (see its docstring —
+    FC-1 ``supports_transfer``; disabled flow == D-5 default path). Per-
+    transfer states (requested/connecting/connected/failed) are recorded as
+    history events (``transfer_state``) through the same buffer that feeds
+    call history. ``action_url`` points <Dial action> at
+    /twilio/transfer-result so the dial outcome is recorded and the caller
+    hears the per-status fallback instead of a silent drop. Web scope passes
+    None (no telephony transfer on web). The ``start_transfer`` call-update
+    trigger is deliberately NOT wired here: it needs the CallSid plumbed to
+    the pipeline (paired with the FC-1 adapter switch / real allowlist
+    source — later decision); until then an approved plan fails closed to
+    the D-5 record+hangup teardown.
+    """
+    from call_control_tools import TransferFlow
+
+    adapter = _phone_telephony_adapter()
+    base = (_twilio_config().get("public_base") or "").rstrip("/")
+    action_url = f"{base}/twilio/transfer-result" if base else None
+
+    def _record(state: str, detail: dict) -> None:
+        if history_recorder is not None and call_id:
+            history_recorder.append_event(
+                call_id, "transfer_state", {"state": state, **detail}
+            )
+        # §8.1: transfer states are handoff transitions on the live machine
+        # (handoff_failed falls back to ACTIVE per the F2 backward edge).
+        sid = _TWILIO_CALL_SIDS.get(call_id or "", "")
+        if sid:
+            if state == "requested":
+                _machine_apply(sid, "handoff_requested", {"target": detail.get("target", "")})
+            elif state == "connected":
+                _machine_apply(sid, "handoff_completed")
+            elif state == "failed":
+                _machine_apply(sid, "handoff_failed", {"reason": detail.get("detail", "")})
+
+    return TransferFlow(
+        supports_transfer=bool(getattr(adapter, "supports_transfer", False)),
+        action_url=action_url,
+        record_state=_record,
+    )
+
+
+async def _persist_transfer_outcome(params: dict, outcome) -> str:
+    """Persist one transfer-outcome event (U-206) — U-205 conventions:
+    deterministic event_id dedups duplicate callbacks to a single append,
+    unknown-CallSid → orphan RECEIVED record (same policy as
+    ``_persist_twilio_status_event``), finalized call → dropped, never
+    revived. Raises on persistence failure (caller maps to 5xx so Twilio
+    retries).
+    """
+    call_sid = (params.get("CallSid") or "").strip()
+    seq = (params.get("SequenceNumber") or params.get("Timestamp") or "").strip()
+    event = CallEvent(
+        event_id=f"{call_sid}:transfer-{outcome.state}:{seq or outcome.detail or '0'}",
+        call_id=call_sid,
+        event_type=f"transfer-{outcome.state}",
+        occurred_at=_twilio_status_occurred_at(params),
+        payload={k: params[k] for k in _TRANSFER_EVENT_KEYS if params.get(k)},
+    )
+    repo = _status_call_repo()
+    try:
+        try:
+            appended = await repo.append_events(call_sid, [event])
+        except KeyError:
+            # Unknown CallSid → orphan persist (policy per _persist_twilio_status_event).
+            await repo.create(
+                CallRecord(
+                    call_id=call_sid,
+                    state=CallState.RECEIVED,
+                    started_at=event.occurred_at,
+                    provider_ids={"twilio_call_sid": call_sid},
+                )
+            )
+            appended = await repo.append_events(call_sid, [event])
+    except CallFinalizedError:
+        return "dropped-finalized"
+    return "persisted" if appended else "deduplicated"
+
+
+def _transfer_result_flow():
+    """TransferFlow seam for /twilio/transfer-result (tests monkeypatch this).
+
+    The endpoint only runs AFTER a dial was approved at plan time, so the
+    capability gate is not re-checked here — ``dial_result`` processes any
+    dial outcome unconditionally and returns the per-status fallback TwiML.
+    """
+    from call_control_tools import TransferFlow
+
+    return TransferFlow()
+
+
+@app.post("/twilio/transfer-result")
+async def twilio_transfer_result(request: Request) -> Response:
+    """§6.4 transfer <Dial action> outcome endpoint (U-206, A-2 in-repo).
+
+    Twilio POSTs ``DialCallStatus`` here when the <Dial> ends for any
+    reason. Contract mirrors /twilio/status-callback: 503 when Twilio is
+    not configured; 403 on missing/invalid X-Twilio-Signature (FC-8 seam,
+    validated against the Twilio-visible external URL — decision A-1); 5xx
+    on persistence failure (persist-before-ack → Twilio retries; the
+    deterministic event_id dedups redeliveries to one append); 200 + TwiML
+    otherwise.
+
+    Response TwiML (caller never dropped — R-P-005 / spec §6.4):
+    busy/no-answer/failed/canceled/unknown → fallback <Say>+<Hangup>;
+    answered/completed → connected + goodbye <Say>+<Hangup>.
+    """
+    cfg = _twilio_config()
+    if not cfg["enabled"]:
+        return Response(
+            content="Twilio integration not configured",
+            status_code=503,
+            media_type="text/plain",
+        )
+
+    raw_query = request.url.query or ""
+    full_url = twilio_sig.build_signed_url(
+        cfg["public_base"], request.url.path, raw_query
+    )
+    form = await request.form()
+    post_params = {k: str(v) for k, v in form.items()}
+    header_sig = request.headers.get("X-Twilio-Signature", "")
+
+    if not twilio_adapter.validate_incoming_call(
+        twilio_adapter.TwilioConfig(
+            auth_token=cfg["auth_token"],
+            public_base_url=cfg["public_base"],
+            account_sid=cfg["account_sid"] or None,
+        ),
+        header_sig,
+        full_url,
+        post_params,
+    ):
+        logger.warning("twilio transfer-result rejected: bad signature")
+        return Response(
+            content="invalid signature", status_code=403, media_type="text/plain"
+        )
+
+    outcome = _transfer_result_flow().dial_result(
+        dial_status=post_params.get("DialCallStatus") or ""
+    )
+
+    if not (post_params.get("CallSid") or "").strip():
+        # No correlation key → cannot record the outcome, but the caller is
+        # still on the line: serve the fallback TwiML rather than an empty
+        # response (which would drop the caller).
+        logger.warning(
+            "twilio transfer-result without CallSid: fallback served, outcome not recorded"
+        )
+        return Response(content=outcome.twiml, media_type="text/xml")
+
+    try:
+        persisted = await _persist_transfer_outcome(post_params, outcome)
+    except Exception:
+        # Persist-before-ack: never ack an unpersisted outcome → 5xx so
+        # Twilio retries (the deterministic event_id dedups redeliveries).
+        logger.exception("twilio transfer-result persistence failed")
+        return Response(
+            content="transfer outcome persistence failed", status_code=500,
+            media_type="text/plain",
+        )
+
+    logger.info(
+        f"twilio transfer-result: {persisted} "
+        f"call_sid={post_params.get('CallSid', '')} "
+        f"dial_status={post_params.get('DialCallStatus', '')} "
+        f"state={outcome.state}"
+    )
+    return Response(content=outcome.twiml, media_type="text/xml")
+
+
+# ---------------------------------------------------------------------------
+# U-305 / U-306 wiring: FC-7 ownership leases + §8.1 call state machine.
+#
+# Two additive layers on the live Twilio media path — no frozen contract is
+# touched (FC-1..FC-8 unchanged), and every layer degrades to the pre-wiring
+# behaviour when its prerequisites are absent:
+#
+#   * ownership (U-305, storage/ownership.py CosmosSessionDirectory) — reserve
+#     capacity at stream acceptance, bind this replica as owner, renew the
+#     lease while the call runs, release at teardown. This is what makes the
+#     U-405 drain census ("zero live leases on the old revision") meaningful.
+#     Gate = MAX_CONCURRENT_CALLS_PER_REPLICA, an EXISTING §11 contract key
+#     (no new config keys — spec §11 freeze). Unset → unleased single-replica
+#     operation (the D-9 validation config), exactly the pre-U-305 behaviour.
+#   * call state machine (U-306, storage/call_state.py) — observational §8.1
+#     transitions for the live call. The AUTHORITATIVE state is the persisted
+#     CallRepository row (U-301); this machine only tracks the local
+#     transitions, so a rejected late/duplicate event is logged and dropped
+#     rather than failing the call. Cross-replica state is NOT claimed: the
+#     route_command transport is not wired yet (documented in
+#     docs/azure/runbooks/owner-loss.md).
+#
+# §6.3 barge-in controller (providers/telephony/barge_in.py) is deliberately
+# NOT wired into this path yet: pipecat-ai 1.4.0's TwilioFrameSerializer +
+# pipeline own interruption detection, the Twilio `clear`, and the mark stream
+# on this leg (see the section comment above `_twilio_config`), so a parallel
+# controller would double-issue clears and split the mark ledger. The
+# controller lands when the FC-1 adapter switch replaces pipecat's serializer
+# handling; until then it is exercised by tests only. This is a documented
+# deferral, not an oversight — no spec claim depends on it while pipecat owns
+# the wire.
+# ---------------------------------------------------------------------------
+
+# Twilio CallSid per live call_id (§6.4 call-update plumbing, U-206 deferral):
+# the media stream knows the CallSid, the tool handlers only know call_id.
+_TWILIO_CALL_SIDS: dict[str, str] = {}
+
+# Per-call §8.1 machines, keyed by CallSid when known (so the status-callback
+# path — which only ever sees CallSid — lands on the same machine as the media
+# stream), else by call_id.
+_CALL_MACHINES: dict[str, "CallStateMachine"] = {}
+
+# Lease timing: reserve TTL covers webhook→stream-acceptance handshake; the
+# owner lease (directory default 30s) is renewed well inside its own TTL so a
+# healthy replica never looks dead, while a crashed one self-reaps within 30s.
+_CALL_RESERVE_TTL_SECONDS = 300
+_OWNERSHIP_RENEW_SECONDS = 10.0
+
+_OWNERSHIP_DIR = None
+_OWNERSHIP_TRIED = False
+
+
+def _runtime_owner_id() -> str:
+    """Stable identity of THIS replica (§8.2 owner). Container Apps sets
+    CONTAINER_APP_REPLICA_NAME; HOSTNAME covers plain container/local runs."""
+    return (
+        os.environ.get("CONTAINER_APP_REPLICA_NAME", "").strip()
+        or os.environ.get("HOSTNAME", "").strip()
+        or f"local-{os.getpid()}"
+    )
+
+
+def _ownership_directory():
+    """FC-7 directory for this replica, or None when ownership is unconfigured.
+
+    Injectable for tests (monkeypatch ``bot._ownership_directory``). Cached
+    after the first call: a missing/invalid gate value is not re-evaluated per
+    call (it is a deployment property, not a per-call one).
+    """
+    global _OWNERSHIP_DIR, _OWNERSHIP_TRIED
+    if _OWNERSHIP_TRIED:
+        return _OWNERSHIP_DIR
+    _OWNERSHIP_TRIED = True
+
+    raw = os.environ.get("MAX_CONCURRENT_CALLS_PER_REPLICA", "").strip()
+    if not raw:
+        logger.info(
+            "call ownership: MAX_CONCURRENT_CALLS_PER_REPLICA unset — "
+            "leases disabled (single-replica validation config, D-9)"
+        )
+        return None
+    try:
+        max_calls = int(raw)
+        if max_calls <= 0:
+            raise ValueError(raw)
+    except ValueError:
+        logger.warning(
+            f"call ownership: invalid MAX_CONCURRENT_CALLS_PER_REPLICA={raw!r} — "
+            "leases disabled"
+        )
+        return None
+
+    try:
+        from storage.ownership import CosmosSessionDirectory
+
+        _OWNERSHIP_DIR = CosmosSessionDirectory(
+            owner_id=_runtime_owner_id(), max_concurrent_calls=max_calls
+        )
+        logger.info(
+            f"call ownership: enabled owner_id={_runtime_owner_id()} "
+            f"max_concurrent={max_calls}"
+        )
+    except Exception as e:  # pragma: no cover — defensive init
+        logger.warning(f"call ownership: init failed ({type(e).__name__}: {e}) — disabled")
+        _OWNERSHIP_DIR = None
+    return _OWNERSHIP_DIR
+
+
+async def _ownership_acquire(call_id: str) -> bool:
+    """Reserve capacity + bind this replica as owner (§8.2/§8.3).
+
+    False ONLY on an explicit admission refusal (CapacityExceededError): the
+    caller of this function refuses the stream. Coordination-plane failures
+    (Cosmos unreachable, race lost) degrade to unleased operation with a log
+    line — turning an ownership-outage into a total call outage would be worse
+    than running without drain coordination, and no HA claim is made anywhere.
+    """
+    directory = _ownership_directory()
+    if directory is None:
+        return True
+
+    from storage.base import CapacityExceededError
+
+    try:
+        await directory.reserve_capacity(
+            call_id=call_id, ttl_seconds=_CALL_RESERVE_TTL_SECONDS
+        )
+        await directory.bind_owner(call_id=call_id, owner_id=_runtime_owner_id())
+    except CapacityExceededError as e:
+        logger.warning(f"call ownership: admission refused for {call_id}: {e}")
+        return False
+    except Exception as e:
+        logger.warning(
+            f"call ownership: acquire failed for {call_id} "
+            f"({type(e).__name__}: {e}) — continuing unleased"
+        )
+        return True
+    return True
+
+
+async def _ownership_renew_loop(call_id: str) -> None:
+    """Keep the owner lease alive for the duration of the call (§8.2).
+
+    Cancelled at teardown. A renewal failure is logged and retried on the next
+    tick; if the lease is genuinely lost the call keeps running (no transparent
+    takeover exists — owner-loss is documented, not hidden).
+    """
+    directory = _ownership_directory()
+    if directory is None:  # pragma: no cover — loop never starts when disabled
+        return
+    owner_id = _runtime_owner_id()
+    while True:
+        await asyncio.sleep(_OWNERSHIP_RENEW_SECONDS)
+        try:
+            await directory.renew_lease(call_id=call_id, owner_id=owner_id)
+        except Exception as e:
+            logger.warning(f"call ownership: renew failed for {call_id}: {e}")
+
+
+async def _ownership_release(call_id: str) -> None:
+    """Release this replica's lease at teardown (§8.3) — frees capacity at once."""
+    directory = _ownership_directory()
+    if directory is None:
+        return
+    try:
+        await directory.release(call_id=call_id, owner_id=_runtime_owner_id())
+    except Exception as e:
+        logger.warning(f"call ownership: release failed for {call_id}: {e}")
+
+
+def _call_machine_key(call_id: str, call_sid: str | None = None) -> str:
+    """Machine key: CallSid when known (status callbacks only see CallSid)."""
+    return (call_sid or "").strip() or call_id
+
+
+def _machine_apply(key: str, event_type: str, payload: dict | None = None) -> None:
+    """Best-effort §8.1 transition on the live machine (observational).
+
+    Never raises into the call path: invalid/late/duplicate events are logged
+    at debug and dropped — the authoritative late-event rules live in
+    CallRepository (U-301) / CallStateMachine's persisted counterpart, and the
+    media path must not fail because an observational transition was refused.
+    """
+    if not key:
+        return
+    try:
+        from storage.call_state import CallStateMachine
+
+        machine = _CALL_MACHINES.get(key)
+        if machine is None:
+            machine = CallStateMachine(call_id=key)
+            _CALL_MACHINES[key] = machine
+        machine.apply(
+            CallEvent(
+                event_id=f"{key}:{event_type}:{machine.version}",
+                call_id=key,
+                event_type=event_type,
+                occurred_at=datetime.now(timezone.utc),
+                payload=payload or {},
+            )
+        )
+    except Exception as e:
+        logger.debug(f"call state {event_type!r} ignored for {key}: {e}")
+
+
+# Twilio CallStatus → §8.1 event vocabulary (status callbacks, §6.1.8).
+_STATUS_TO_EVENT = {
+    "queued": "connecting",
+    "initiated": "connecting",
+    "ringing": "connecting",
+    "in-progress": "active",
+    "completed": "ended",
+    "busy": "failed",
+    "no-answer": "failed",
+    "failed": "failed",
+    "canceled": "failed",
+}
+
+
+def _machine_apply_status(call_sid: str, call_status: str) -> None:
+    """Map one Twilio status callback onto the machine (no-op when unmapped)."""
+    event_type = _STATUS_TO_EVENT.get((call_status or "").strip().lower())
+    if not event_type:
+        return
+    payload = {}
+    if event_type == "failed":
+        # §8.1: FAILED requires reason + cleanup action.
+        payload = {"reason": f"twilio:{call_status}", "cleanup": "media-stream-closed"}
+    _machine_apply(call_sid, event_type, payload)
+
+
+def _twilio_call_update_client():
+    """Twilio REST client for §6.4 call-updates, or None when unconfigured."""
+    cfg = _twilio_config()
+    if not (cfg["account_sid"] and cfg["auth_token"]):
+        return None
+    try:
+        from twilio.rest import Client
+    except Exception:  # pragma: no cover — SDK absent
+        return None
+    return Client(cfg["account_sid"], cfg["auth_token"])
+
+
+def _phone_start_transfer(call_id: str):
+    """§6.4 call-update trigger for the phone handoff path (U-206 deferral).
+
+    Returns the async ``start_transfer(plan) -> bool`` seam consumed by
+    call_control_tools' grace-then-end task AFTER write_outcome. Sequence per
+    §6.4: outcome row written → this call-update replaces the call's TwiML with
+    <Dial> (the actual handoff to the agent) → EndTaskFrame closes the stream.
+    False/exception → the caller is never dropped (D-5 record+hangup fallback
+    runs). Only reached when the FC-1 ``supports_transfer`` flag is open.
+    """
+    async def start_transfer(plan) -> bool:
+        call_sid = _TWILIO_CALL_SIDS.get(call_id, "")
+        target = getattr(plan, "target", "") or ""
+        if not (call_sid and target):
+            logger.warning(
+                f"transfer: missing {'CallSid' if not call_sid else 'target'} "
+                f"for call_id={call_id} — falling back to D-5 record+hangup"
+            )
+            return False
+        client = _twilio_call_update_client()
+        if client is None:
+            logger.warning("transfer: Twilio REST credentials unavailable")
+            return False
+        base = (_twilio_config().get("public_base") or "").rstrip("/")
+        twiml = twilio_adapter.build_twiml_dial_transfer(
+            target,
+            action_url=f"{base}/twilio/transfer-result" if base else None,
+        )
+        try:
+            await asyncio.to_thread(client.calls(call_sid).update, twiml=twiml)
+        except Exception as e:
+            logger.warning(
+                f"transfer: call-update failed call_id={call_id} "
+                f"call_sid={call_sid} ({type(e).__name__}: {e})"
+            )
+            return False
+        logger.info(f"transfer: call-update issued call_id={call_id} call_sid={call_sid}")
+        return True
+
+    return start_transfer
 
 
 # How long we wait for Twilio to send its `start` event before giving up on an
@@ -7116,16 +7792,42 @@ async def twilio_media_stream(websocket: WebSocket) -> None:
     )
 
     call_id = f"twilio-{stream_sid}"
+    if call_sid:
+        # §6.4 call-update plumbing: the tool handlers resolve CallSid by call_id.
+        _TWILIO_CALL_SIDS[call_id] = call_sid
     logger.info(f"twilio media-stream start: call_id={call_id} caller={caller}")
 
-    # Mirror /phone/ws: register the session before handing off to the kernel
-    # (the kernel's finally unregisters it).
-    primary = _ws_emit(websocket)
-    await session_register(call_id, caller=caller, primary_emit=primary)
+    # §8.2/§8.3: reserve capacity + bind this replica as the call's owner BEFORE
+    # any media flows. Explicit admission refusal → refuse the stream (Twilio
+    # releases the caller normally); coordination-plane failures degrade to
+    # unleased operation (see _ownership_acquire).
+    if not await _ownership_acquire(call_id):
+        logger.warning(f"twilio media-stream refused at capacity: call_id={call_id}")
+        _TWILIO_CALL_SIDS.pop(call_id, None)
+        await websocket.close(code=1013)  # 1013 = try again later
+        return
 
-    await _run_phone_session(
-        websocket, call_id=call_id, caller=caller, serializer=serializer
-    )
+    machine_key = _call_machine_key(call_id, call_sid)
+    _machine_apply(machine_key, "connecting")
+    renew_task = asyncio.create_task(_ownership_renew_loop(call_id))
+    try:
+        # Mirror /phone/ws: register the session before handing off to the kernel
+        # (the kernel's finally unregisters it).
+        primary = _ws_emit(websocket)
+        await session_register(call_id, caller=caller, primary_emit=primary)
+        _machine_apply(machine_key, "active")
+
+        await _run_phone_session(
+            websocket, call_id=call_id, caller=caller, serializer=serializer
+        )
+    finally:
+        # §8.1 teardown + §8.3 release: the kernel's finally has already
+        # unregistered the session and flushed history when this runs.
+        renew_task.cancel()
+        _machine_apply(machine_key, "ended")
+        await _ownership_release(call_id)
+        _TWILIO_CALL_SIDS.pop(call_id, None)
+        _CALL_MACHINES.pop(machine_key, None)
 
 
 @app.websocket("/monitor/ws")
